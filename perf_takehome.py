@@ -73,9 +73,14 @@ class KernelBuilder:
                     valu_ops.append((ops[i], ops[i+1], ops[i+2], ops[i+3]))
                 instrs.append({"valu": valu_ops})
             elif engine == "mega_bundle":
-                # Fully packed bundle with loads + valu
+                # Fully packed bundle with multiple engines
+                # slot should be a dict like {"load": [...], "valu": [...]}
                 bundle = slot
                 instrs.append(bundle)
+            elif engine == "load_valu_bundle":
+                # Pack loads with valu operations in one cycle
+                load_ops, valu_ops = slot
+                instrs.append({"load": load_ops, "valu": valu_ops})
             else:
                 instrs.append({engine: [slot]})
         return instrs
@@ -204,9 +209,9 @@ class KernelBuilder:
                 # Compute addresses for node values: v_addr = forest_values_p + v_idx
                 body.append(("valu", ("+", v_addr, v_forest_base, v_idx)))
 
-                # Load 8 node values (scattered loads) - pack  all into mega bundles
-                # Combine loads with hash stages from previous iteration when possible
+                # Load 8 node values (scattered loads)
                 # Pack 2 loads per cycle using both load slots
+                # We'll do these sequentially for now, could overlap with other ops later
                 body.append(("load_pair", (v_node_val + 0, v_addr + 0, v_node_val + 1, v_addr + 1)))
                 body.append(("load_pair", (v_node_val + 2, v_addr + 2, v_node_val + 3, v_addr + 3)))
                 body.append(("load_pair", (v_node_val + 4, v_addr + 4, v_node_val + 5, v_addr + 5)))
