@@ -184,8 +184,11 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting optimized vectorized loop"))
 
         # Allocate vector registers for software pipelining
-        # Process 4 batches in parallel to overlap loads with computation
-        N_PIPELINE = 4  # Number of batches in flight
+        # Process many batches in parallel to overlap loads with computation
+        # Each buffer needs 6 vectors × 8 words = 48 words
+        # We also have hash constants taking space, so use fewer pipeline stages
+        num_batches = batch_size // VLEN
+        N_PIPELINE = min(16, num_batches)  # Number of batches in flight
         v_idx = [self.alloc_scratch(f"v_idx_{i}", VLEN) for i in range(N_PIPELINE)]
         v_val = [self.alloc_scratch(f"v_val_{i}", VLEN) for i in range(N_PIPELINE)]
         v_node_val = [self.alloc_scratch(f"v_node_val_{i}", VLEN) for i in range(N_PIPELINE)]
@@ -205,81 +208,113 @@ class KernelBuilder:
             body.append(("alu", ("+", base_val_addr, self.scratch["inp_values_p"], tmp1)))
             base_addrs.append((base_idx_addr, base_val_addr))
 
-        # Main loop with software pipelining
-        # Process batches with overlapping: while batch N loads, batch N-1 computes
-        num_batches = batch_size // VLEN
+        # Main loop with 2x unrolling to hide load latency
+        # Process 2 batches at once, interleaving loads and compute
 
         for round in range(rounds):
-            for batch_idx in range(num_batches):
-                batch_base = batch_idx * VLEN
-                base_idx_addr, base_val_addr = base_addrs[batch_idx]
+            for batch_idx in range(0, num_batches, 2):
+                batch_base_0 = batch_idx * VLEN
+                buf_0 = batch_idx % N_PIPELINE
+                base_idx_addr_0, base_val_addr_0 = base_addrs[batch_idx]
 
-                # Use rotating buffer index for pipeline
-                buf = batch_idx % N_PIPELINE
+                batch_base_1 = (batch_idx + 1) * VLEN if batch_idx + 1 < num_batches else batch_base_0
+                buf_1 = (batch_idx + 1) % N_PIPELINE if batch_idx + 1 < num_batches else buf_0
+                base_idx_addr_1, base_val_addr_1 = base_addrs[batch_idx + 1] if batch_idx + 1 < num_batches else base_addrs[batch_idx]
 
-                # Pack operations into mega-bundles
-                # Combine loads + valu operations in same cycle when possible
+                #=== BATCH 0: Load phase ===
+                body.append(("load_vload_pair", (v_idx[buf_0], base_idx_addr_0, v_val[buf_0], base_val_addr_0)))
+                if batch_base_0 < VLEN:
+                    for vi in range(min(VLEN, batch_size - batch_base_0)):
+                        body.append(("debug", ("compare", v_idx[buf_0] + vi, (round, batch_base_0 + vi, "idx"))))
+                        body.append(("debug", ("compare", v_val[buf_0] + vi, (round, batch_base_0 + vi, "val"))))
 
-                # Load 8 indices and values - pack both vloads into one cycle
-                body.append(("load_vload_pair", (v_idx[buf], base_idx_addr, v_val[buf], base_val_addr)))
-                if batch_base < VLEN:
-                    for vi in range(min(VLEN, batch_size - batch_base)):
-                        body.append(("debug", ("compare", v_idx[buf] + vi, (round, batch_base + vi, "idx"))))
-                    for vi in range(min(VLEN, batch_size - batch_base)):
-                        body.append(("debug", ("compare", v_val[buf] + vi, (round, batch_base + vi, "val"))))
+                # Compute addresses while load completes
+                body.append(("valu", ("+", v_addr[buf_0], v_forest_base, v_idx[buf_0])))
 
-                # Compute addresses for node values
-                body.append(("valu", ("+", v_addr[buf], v_forest_base, v_idx[buf])))
+                #=== BATCH 1: Load phase (if exists) ===
+                if batch_idx + 1 < num_batches:
+                    body.append(("load_vload_pair", (v_idx[buf_1], base_idx_addr_1, v_val[buf_1], base_val_addr_1)))
+                    if batch_base_1 < VLEN:
+                        for vi in range(min(VLEN, batch_size - batch_base_1)):
+                            body.append(("debug", ("compare", v_idx[buf_1] + vi, (round, batch_base_1 + vi, "idx"))))
+                            body.append(("debug", ("compare", v_val[buf_1] + vi, (round, batch_base_1 + vi, "val"))))
+                    body.append(("valu", ("+", v_addr[buf_1], v_forest_base, v_idx[buf_1])))
 
-                # Load 8 node values (scattered loads) - pack into 4 cycles (2 loads each)
-                body.append(("load_pair", (v_node_val[buf] + 0, v_addr[buf] + 0, v_node_val[buf] + 1, v_addr[buf] + 1)))
-                body.append(("load_pair", (v_node_val[buf] + 2, v_addr[buf] + 2, v_node_val[buf] + 3, v_addr[buf] + 3)))
-                body.append(("load_pair", (v_node_val[buf] + 4, v_addr[buf] + 4, v_node_val[buf] + 5, v_addr[buf] + 5)))
-                body.append(("load_pair", (v_node_val[buf] + 6, v_addr[buf] + 6, v_node_val[buf] + 7, v_addr[buf] + 7)))
+                #=== BATCH 0: Node loads ===
+                body.append(("load_pair", (v_node_val[buf_0] + 0, v_addr[buf_0] + 0, v_node_val[buf_0] + 1, v_addr[buf_0] + 1)))
+                body.append(("load_pair", (v_node_val[buf_0] + 2, v_addr[buf_0] + 2, v_node_val[buf_0] + 3, v_addr[buf_0] + 3)))
+                body.append(("load_pair", (v_node_val[buf_0] + 4, v_addr[buf_0] + 4, v_node_val[buf_0] + 5, v_addr[buf_0] + 5)))
+                body.append(("load_pair", (v_node_val[buf_0] + 6, v_addr[buf_0] + 6, v_node_val[buf_0] + 7, v_addr[buf_0] + 7)))
+                if batch_base_0 < VLEN:
+                    for vi in range(min(VLEN, batch_size - batch_base_0)):
+                        body.append(("debug", ("compare", v_node_val[buf_0] + vi, (round, batch_base_0 + vi, "node_val"))))
 
-                if batch_base < VLEN:
-                    for vi in range(min(VLEN, batch_size - batch_base)):
-                        body.append(("debug", ("compare", v_node_val[buf] + vi, (round, batch_base + vi, "node_val"))))
+                #=== BATCH 1: Node loads (if exists) ===
+                if batch_idx + 1 < num_batches:
+                    body.append(("load_pair", (v_node_val[buf_1] + 0, v_addr[buf_1] + 0, v_node_val[buf_1] + 1, v_addr[buf_1] + 1)))
+                    body.append(("load_pair", (v_node_val[buf_1] + 2, v_addr[buf_1] + 2, v_node_val[buf_1] + 3, v_addr[buf_1] + 3)))
+                    body.append(("load_pair", (v_node_val[buf_1] + 4, v_addr[buf_1] + 4, v_node_val[buf_1] + 5, v_addr[buf_1] + 5)))
+                    body.append(("load_pair", (v_node_val[buf_1] + 6, v_addr[buf_1] + 6, v_node_val[buf_1] + 7, v_addr[buf_1] + 7)))
+                    if batch_base_1 < VLEN:
+                        for vi in range(min(VLEN, batch_size - batch_base_1)):
+                            body.append(("debug", ("compare", v_node_val[buf_1] + vi, (round, batch_base_1 + vi, "node_val"))))
 
-                # Hash: val ^= node_val
-                body.append(("valu", ("^", v_val[buf], v_val[buf], v_node_val[buf])))
-
-                # Apply 6 hash stages - each stage must complete before next
-                # But within each stage, pack the two independent operations
+                #=== BATCH 0: Compute phase ===
+                body.append(("valu", ("^", v_val[buf_0], v_val[buf_0], v_node_val[buf_0])))
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     c1_vec, c3_vec = hash_consts_vec[hi]
-                    # Pack op1 and op3 together (independent)
-                    body.append(("valu_pair", (op1, v_tmp1[buf], v_val[buf], c1_vec, op3, v_tmp2[buf], v_val[buf], c3_vec)))
-                    # Then execute dependent op2
-                    body.append(("valu", (op2, v_val[buf], v_tmp1[buf], v_tmp2[buf])))
+                    body.append(("valu_pair", (op1, v_tmp1[buf_0], v_val[buf_0], c1_vec, op3, v_tmp2[buf_0], v_val[buf_0], c3_vec)))
+                    body.append(("valu", (op2, v_val[buf_0], v_tmp1[buf_0], v_tmp2[buf_0])))
+                    if batch_base_0 < VLEN:
+                        for vi in range(min(VLEN, batch_size - batch_base_0)):
+                            body.append(("debug", ("compare", v_val[buf_0] + vi, (round, batch_base_0 + vi, "hash_stage", hi))))
+                if batch_base_0 < VLEN:
+                    for vi in range(min(VLEN, batch_size - batch_base_0)):
+                        body.append(("debug", ("compare", v_val[buf_0] + vi, (round, batch_base_0 + vi, "hashed_val"))))
 
-                    if batch_base < VLEN:
-                        for vi in range(min(VLEN, batch_size - batch_base)):
-                            body.append(("debug", ("compare", v_val[buf] + vi, (round, batch_base + vi, "hash_stage", hi))))
+                body.append(("valu_pair", ("&", v_tmp1[buf_0], v_val[buf_0], v_one, "<<", v_tmp2[buf_0], v_idx[buf_0], v_one)))
+                body.append(("valu", ("+", v_tmp1[buf_0], v_one, v_tmp1[buf_0])))
+                body.append(("valu", ("+", v_idx[buf_0], v_tmp2[buf_0], v_tmp1[buf_0])))
+                if batch_base_0 < VLEN:
+                    for vi in range(min(VLEN, batch_size - batch_base_0)):
+                        body.append(("debug", ("compare", v_idx[buf_0] + vi, (round, batch_base_0 + vi, "next_idx"))))
 
-                if batch_base < VLEN:
-                    for vi in range(min(VLEN, batch_size - batch_base)):
-                        body.append(("debug", ("compare", v_val[buf] + vi, (round, batch_base + vi, "hashed_val"))))
+                body.append(("valu", ("<", v_tmp1[buf_0], v_idx[buf_0], v_n_nodes)))
+                body.append(("valu", ("*", v_idx[buf_0], v_idx[buf_0], v_tmp1[buf_0])))
+                if batch_base_0 < VLEN:
+                    for vi in range(min(VLEN, batch_size - batch_base_0)):
+                        body.append(("debug", ("compare", v_idx[buf_0] + vi, (round, batch_base_0 + vi, "wrapped_idx"))))
 
-                # Compute next index and wrap - pack into fewer cycles
-                body.append(("valu_pair", ("&", v_tmp1[buf], v_val[buf], v_one, "<<", v_tmp2[buf], v_idx[buf], v_one)))
-                body.append(("valu", ("+", v_tmp1[buf], v_one, v_tmp1[buf])))
-                body.append(("valu", ("+", v_idx[buf], v_tmp2[buf], v_tmp1[buf])))
+                body.append(("store_vstore_pair", (base_idx_addr_0, v_idx[buf_0], base_val_addr_0, v_val[buf_0])))
 
-                if batch_base < VLEN:
-                    for vi in range(min(VLEN, batch_size - batch_base)):
-                        body.append(("debug", ("compare", v_idx[buf] + vi, (round, batch_base + vi, "next_idx"))))
+                #=== BATCH 1: Compute phase (if exists) ===
+                if batch_idx + 1 < num_batches:
+                    body.append(("valu", ("^", v_val[buf_1], v_val[buf_1], v_node_val[buf_1])))
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        c1_vec, c3_vec = hash_consts_vec[hi]
+                        body.append(("valu_pair", (op1, v_tmp1[buf_1], v_val[buf_1], c1_vec, op3, v_tmp2[buf_1], v_val[buf_1], c3_vec)))
+                        body.append(("valu", (op2, v_val[buf_1], v_tmp1[buf_1], v_tmp2[buf_1])))
+                        if batch_base_1 < VLEN:
+                            for vi in range(min(VLEN, batch_size - batch_base_1)):
+                                body.append(("debug", ("compare", v_val[buf_1] + vi, (round, batch_base_1 + vi, "hash_stage", hi))))
+                    if batch_base_1 < VLEN:
+                        for vi in range(min(VLEN, batch_size - batch_base_1)):
+                            body.append(("debug", ("compare", v_val[buf_1] + vi, (round, batch_base_1 + vi, "hashed_val"))))
 
-                # Wrap
-                body.append(("valu", ("<", v_tmp1[buf], v_idx[buf], v_n_nodes)))
-                body.append(("valu", ("*", v_idx[buf], v_idx[buf], v_tmp1[buf])))
+                    body.append(("valu_pair", ("&", v_tmp1[buf_1], v_val[buf_1], v_one, "<<", v_tmp2[buf_1], v_idx[buf_1], v_one)))
+                    body.append(("valu", ("+", v_tmp1[buf_1], v_one, v_tmp1[buf_1])))
+                    body.append(("valu", ("+", v_idx[buf_1], v_tmp2[buf_1], v_tmp1[buf_1])))
+                    if batch_base_1 < VLEN:
+                        for vi in range(min(VLEN, batch_size - batch_base_1)):
+                            body.append(("debug", ("compare", v_idx[buf_1] + vi, (round, batch_base_1 + vi, "next_idx"))))
 
-                if batch_base < VLEN:
-                    for vi in range(min(VLEN, batch_size - batch_base)):
-                        body.append(("debug", ("compare", v_idx[buf] + vi, (round, batch_base + vi, "wrapped_idx"))))
+                    body.append(("valu", ("<", v_tmp1[buf_1], v_idx[buf_1], v_n_nodes)))
+                    body.append(("valu", ("*", v_idx[buf_1], v_idx[buf_1], v_tmp1[buf_1])))
+                    if batch_base_1 < VLEN:
+                        for vi in range(min(VLEN, batch_size - batch_base_1)):
+                            body.append(("debug", ("compare", v_idx[buf_1] + vi, (round, batch_base_1 + vi, "wrapped_idx"))))
 
-                # Store results
-                body.append(("store_vstore_pair", (base_idx_addr, v_idx[buf], base_val_addr, v_val[buf])))
+                    body.append(("store_vstore_pair", (base_idx_addr_1, v_idx[buf_1], base_val_addr_1, v_val[buf_1])))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
