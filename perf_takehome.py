@@ -72,6 +72,16 @@ class KernelBuilder:
                 for i in range(0, len(ops), 4):
                     valu_ops.append((ops[i], ops[i+1], ops[i+2], ops[i+3]))
                 instrs.append({"valu": valu_ops})
+            elif engine == "valu_hex" or engine == "valu_six":
+                # Pack up to 6 VALU ops into one cycle (max VALU slots)
+                # slot should be a list of tuples, each (op, dest, src1, src2)
+                ops = slot
+                valu_ops = []
+                # Each 4 elements = (op, dest, src1, src2)
+                for i in range(0, len(ops), 4):
+                    if i + 3 < len(ops):
+                        valu_ops.append((ops[i], ops[i+1], ops[i+2], ops[i+3]))
+                instrs.append({"valu": valu_ops})
             elif engine == "mega_bundle":
                 # Fully packed bundle with multiple engines
                 # slot should be a dict like {"load": [...], "valu": [...]}
@@ -239,20 +249,19 @@ class KernelBuilder:
                     for vi in range(min(VLEN, batch_size - batch_base)):
                         body.append(("debug", ("compare", v_val + vi, (round, batch_base + vi, "hashed_val"))))
 
-                # Compute next index - use bitwise ops and shifts for better performance
-                # val & 1 gives 0 for even, 1 for odd; we want 1 for even, 2 for odd
-                # So: offset = 1 + (val & 1), and idx = (idx << 1) + offset
-                body.append(("valu_pair", ("&", v_tmp1, v_val, v_one, "<<", v_idx, v_idx, v_one)))  # (val&1) and (idx<<1) in parallel
-                body.append(("valu", ("+", v_tmp2, v_one, v_tmp1)))  # offset = 1 + (val&1)
-                body.append(("valu", ("+", v_idx, v_idx, v_tmp2)))  # idx = (idx<<1) + offset
+                # Compute next index and wrap - carefully pack to avoid dependencies
+                # Can't pack ops that write/read same register in one cycle
+                body.append(("valu_pair", ("&", v_tmp1, v_val, v_one, "<<", v_tmp2, v_idx, v_one)))  # (val&1) and (idx<<1)
+                body.append(("valu", ("+", v_tmp1, v_one, v_tmp1)))  # offset = 1 + (val&1)
+                body.append(("valu", ("+", v_idx, v_tmp2, v_tmp1)))  # idx = (idx<<1) + offset
 
                 if batch_base < VLEN:
                     for vi in range(min(VLEN, batch_size - batch_base)):
                         body.append(("debug", ("compare", v_idx + vi, (round, batch_base + vi, "next_idx"))))
 
-                # Wrap: idx = 0 if idx >= n_nodes else idx
-                body.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
-                body.append(("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero)))
+                # Wrap: idx = idx * mask where mask = (idx < n_nodes)
+                body.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))  # mask
+                body.append(("valu", ("*", v_idx, v_idx, v_tmp1)))     # idx = idx * mask
 
                 if batch_base < VLEN:
                     for vi in range(min(VLEN, batch_size - batch_base)):
