@@ -234,11 +234,12 @@ class KernelBuilder:
                     for vi in range(min(VLEN, batch_size - batch_base)):
                         body.append(("debug", ("compare", v_val + vi, (round, batch_base + vi, "hashed_val"))))
 
-                # Compute next index - pack independent operations
-                body.append(("valu_pair", ("%", v_tmp1, v_val, v_two, "*", v_idx, v_idx, v_two)))  # val%2 and idx*2 in parallel
-                body.append(("valu", ("==", v_tmp1, v_tmp1, v_zero)))  # is_even
-                body.append(("flow", ("vselect", v_tmp2, v_tmp1, v_one, v_two)))  # 1 if even else 2
-                body.append(("valu", ("+", v_idx, v_idx, v_tmp2)))  # idx = idx*2 + offset
+                # Compute next index - use bitwise ops and shifts for better performance
+                # val & 1 gives 0 for even, 1 for odd; we want 1 for even, 2 for odd
+                # So: offset = 1 + (val & 1), and idx = (idx << 1) + offset
+                body.append(("valu_pair", ("&", v_tmp1, v_val, v_one, "<<", v_idx, v_idx, v_one)))  # (val&1) and (idx<<1) in parallel
+                body.append(("valu", ("+", v_tmp2, v_one, v_tmp1)))  # offset = 1 + (val&1)
+                body.append(("valu", ("+", v_idx, v_idx, v_tmp2)))  # idx = (idx<<1) + offset
 
                 if batch_base < VLEN:
                     for vi in range(min(VLEN, batch_size - batch_base)):
