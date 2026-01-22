@@ -222,106 +222,141 @@ class KernelBuilder:
         # Note: ALU operations are very fast and don't bottleneck, so keeping simple
 
         # Main loop - process all batches together with maximally packed VALU operations
-        # Strategy: separate into phases where operations from ALL batches can be packed together
+        # Strategy: ROUND FUSION - process ALL rounds before storing (ultimate fusion!)
+        K = rounds  # Fusion factor - process all 16 rounds per load/store
 
-        for round in range(rounds):
+        for round_group_start in range(0, rounds, K):
+            rounds_in_group = min(K, rounds - round_group_start)
+
             # Process batches in groups of N_PIPELINE to avoid register conflicts
-            # Aggressive optimization: minimal phases, maximal packing
             for group_start in range(0, num_batches, N_PIPELINE):
                 group_size = min(N_PIPELINE, num_batches - group_start)
 
-                # Define tasks for this group
+                # Define tasks for this group - WITH ROUND FUSION
                 tasks = []
+                batch_tasks = []
+
                 for local_idx in range(group_size):
                     buf = local_idx
                     batch_idx = group_start + local_idx
                     base_idx_addr, base_val_addr = base_addrs[batch_idx]
 
-                    # Task for input loads (vload_pair)
-                    input_load_task = {'engine': 'load', 'slot': [("vload", v_idx[buf], base_idx_addr), ("vload", v_val[buf], base_val_addr)], 'deps': [], 'done': False}
+                    batch_chain = {}
+
+                    # LOAD ONCE at the start of the fusion group
+                    input_load_task = {'engine': 'load', 'slot': [("vload", v_idx[buf], base_idx_addr), ("vload", v_val[buf], base_val_addr)], 'deps': [], 'done': False, 'batch': buf}
                     tasks.append(input_load_task)
+                    batch_chain['input_load'] = input_load_task
 
-                    # Task for address computation
-                    addr_task = {'engine': 'valu', 'slot': ("+", v_addr[buf], v_forest_base, v_idx[buf]), 'deps': [input_load_task], 'done': False}
-                    tasks.append(addr_task)
+                    # Now process MULTIPLE rounds in sequence
+                    previous_round_task = input_load_task
 
-                    # Tasks for scattered loads (4 load_pairs)
-                    scattered_load_tasks = []
-                    for load_idx in range(4):
-                        offset = load_idx * 2
-                        scattered_load_task = {'engine': 'load', 'slot': [("load", v_node_val[buf] + offset, v_addr[buf] + offset), ("load", v_node_val[buf] + offset + 1, v_addr[buf] + offset + 1)], 'deps': [addr_task], 'done': False}
-                        tasks.append(scattered_load_task)
-                        scattered_load_tasks.append(scattered_load_task)
+                    for round_in_group in range(rounds_in_group):
+                        # Each round: addr compute → node loads → XOR → hash → next_idx
 
-                    # Task for XOR
-                    xor_task = {'engine': 'valu', 'slot': ("^", v_val[buf], v_val[buf], v_node_val[buf]), 'deps': scattered_load_tasks, 'done': False}
-                    tasks.append(xor_task)
+                        # Address computation
+                        addr_task = {'engine': 'valu', 'slot': ("+", v_addr[buf], v_forest_base, v_idx[buf]), 'deps': [previous_round_task], 'done': False, 'batch': buf}
+                        tasks.append(addr_task)
 
-                    # Tasks for hash stages
-                    previous_hash_task = xor_task
-                    for stage_idx in range(6):
-                        op1, val1, op2, op3, val3 = HASH_STAGES[stage_idx]
-                        c1_vec, c3_vec = hash_consts_vec[stage_idx]
+                        # Scattered loads (4 pairs)
+                        scattered_load_tasks = []
+                        for load_idx in range(4):
+                            offset = load_idx * 2
+                            scattered_load_task = {'engine': 'load', 'slot': [("load", v_node_val[buf] + offset, v_addr[buf] + offset), ("load", v_node_val[buf] + offset + 1, v_addr[buf] + offset + 1)], 'deps': [addr_task], 'done': False, 'batch': buf, 'priority': 10}
+                            tasks.append(scattered_load_task)
+                            scattered_load_tasks.append(scattered_load_task)
 
-                        op1_task = {'engine': 'valu', 'slot': (op1, v_tmp1[buf], v_val[buf], c1_vec), 'deps': [previous_hash_task], 'done': False}
-                        op3_task = {'engine': 'valu', 'slot': (op3, v_tmp2[buf], v_val[buf], c3_vec), 'deps': [previous_hash_task], 'done': False}
-                        tasks.append(op1_task)
-                        tasks.append(op3_task)
+                        # XOR
+                        xor_task = {'engine': 'valu', 'slot': ("^", v_val[buf], v_val[buf], v_node_val[buf]), 'deps': scattered_load_tasks, 'done': False, 'batch': buf}
+                        tasks.append(xor_task)
 
-                        op2_task = {'engine': 'valu', 'slot': (op2, v_val[buf], v_tmp1[buf], v_tmp2[buf]), 'deps': [op1_task, op3_task], 'done': False}
-                        tasks.append(op2_task)
+                        # Hash stages
+                        previous_hash_task = xor_task
+                        for stage_idx in range(6):
+                            op1, val1, op2, op3, val3 = HASH_STAGES[stage_idx]
+                            c1_vec, c3_vec = hash_consts_vec[stage_idx]
 
-                        previous_hash_task = op2_task
+                            parallel_group_id = f"hash_r{round_in_group}_s{stage_idx}_b{buf}"
+                            op1_task = {'engine': 'valu', 'slot': (op1, v_tmp1[buf], v_val[buf], c1_vec), 'deps': [previous_hash_task], 'done': False, 'batch': buf, 'parallel_group': parallel_group_id}
+                            op3_task = {'engine': 'valu', 'slot': (op3, v_tmp2[buf], v_val[buf], c3_vec), 'deps': [previous_hash_task], 'done': False, 'batch': buf, 'parallel_group': parallel_group_id}
+                            tasks.append(op1_task)
+                            tasks.append(op3_task)
 
-                    # Tasks for next index computation (6 VALU ops)
-                    previous_next_task = previous_hash_task
-                    next_ops = [
-                        ("&", v_tmp1[buf], v_val[buf], v_one),
-                        ("<<", v_tmp2[buf], v_idx[buf], v_one),
-                        ("+", v_tmp1[buf], v_one, v_tmp1[buf]),
-                        ("+", v_idx[buf], v_tmp2[buf], v_tmp1[buf]),
-                        ("<", v_tmp1[buf], v_idx[buf], v_n_nodes),
-                        ("*", v_idx[buf], v_idx[buf], v_tmp1[buf])
-                    ]
-                    for next_slot in next_ops:
-                        next_task = {'engine': 'valu', 'slot': next_slot, 'deps': [previous_next_task], 'done': False}
-                        tasks.append(next_task)
-                        previous_next_task = next_task
+                            op2_task = {'engine': 'valu', 'slot': (op2, v_val[buf], v_tmp1[buf], v_tmp2[buf]), 'deps': [op1_task, op3_task], 'done': False, 'batch': buf}
+                            tasks.append(op2_task)
+                            previous_hash_task = op2_task
 
-                    # Task for stores (vstore_pair)
-                    store_task = {'engine': 'store', 'slot': [("vstore", base_idx_addr, v_idx[buf]), ("vstore", base_val_addr, v_val[buf])], 'deps': [previous_next_task], 'done': False}
+                        # Next index computation
+                        previous_next_task = previous_hash_task
+                        next_ops = [
+                            ("&", v_tmp1[buf], v_val[buf], v_one),
+                            ("<<", v_tmp2[buf], v_idx[buf], v_one),
+                            ("+", v_tmp1[buf], v_one, v_tmp1[buf]),
+                            ("+", v_idx[buf], v_tmp2[buf], v_tmp1[buf]),
+                            ("<", v_tmp1[buf], v_idx[buf], v_n_nodes),
+                            ("*", v_idx[buf], v_idx[buf], v_tmp1[buf])
+                        ]
+                        for next_slot in next_ops:
+                            next_task = {'engine': 'valu', 'slot': next_slot, 'deps': [previous_next_task], 'done': False, 'batch': buf}
+                            tasks.append(next_task)
+                            previous_next_task = next_task
+
+                        # This round's output becomes next round's input
+                        previous_round_task = previous_next_task
+
+                    # STORE ONCE at the end of the fusion group
+                    store_task = {'engine': 'store', 'slot': [("vstore", base_idx_addr, v_idx[buf]), ("vstore", base_val_addr, v_val[buf])], 'deps': [previous_round_task], 'done': False, 'batch': buf}
                     tasks.append(store_task)
+                    batch_chain['store'] = store_task
 
-                # Scheduler loop
+                    batch_tasks.append(batch_chain)
+
+                # WAVE-BASED scheduler: maximize ILP by greedily filling ALL slots each cycle
+                # Key insight: VLIW has massive parallelism - 2 loads + 2 stores + 6 VALU per cycle
                 while any(not t['done'] for t in tasks):
                     ready = [t for t in tasks if not t['done'] and all(d['done'] for d in t['deps'])]
                     if not ready:
                         break
 
+                    # Group by engine type
                     ready_by_engine = defaultdict(list)
                     for t in ready:
                         ready_by_engine[t['engine']].append(t)
 
                     bundle = {}
-                    for engine in ['load', 'store', 'valu']:  # Prioritize load and store
-                        if engine in ready_by_engine:
-                            ready_engine = ready_by_engine[engine]
-                            limit = SLOT_LIMITS[engine]
-                            selected = []
-                            current_slots = 0
-                            for t in ready_engine:
-                                slot_count = len(t['slot']) if isinstance(t['slot'], list) else 1
-                                if current_slots + slot_count <= limit:
-                                    selected.append(t)
-                                    current_slots += slot_count
-                            if selected:
-                                bundle[engine] = []
-                                for t in selected:
-                                    if isinstance(t['slot'], list):
-                                        bundle[engine].extend(t['slot'])
-                                    else:
-                                        bundle[engine].append(t['slot'])
-                                    t['done'] = True
+
+                    # GREEDY PACKING: Fill every available slot in this cycle
+                    # Process in order: load (critical path), valu (abundant), store (end of pipeline)
+                    for engine in ['load', 'valu', 'store']:
+                        if engine not in ready_by_engine:
+                            continue
+
+                        ready_engine = ready_by_engine[engine]
+                        limit = SLOT_LIMITS[engine]
+
+                        # Sort by priority for better scheduling
+                        ready_engine.sort(key=lambda t: -t.get('priority', 0))
+
+                        selected = []
+                        current_slots = 0
+
+                        # Greedy: pack as many operations as possible
+                        for t in ready_engine:
+                            slot_count = len(t['slot']) if isinstance(t['slot'], list) else 1
+                            if current_slots + slot_count <= limit:
+                                selected.append(t)
+                                current_slots += slot_count
+                                if current_slots == limit:  # Fully saturated
+                                    break
+
+                        if selected:
+                            bundle[engine] = []
+                            for t in selected:
+                                if isinstance(t['slot'], list):
+                                    bundle[engine].extend(t['slot'])
+                                else:
+                                    bundle[engine].append(t['slot'])
+                                t['done'] = True
 
                     if bundle:
                         body.append(("mega_bundle", bundle))
