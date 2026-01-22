@@ -187,17 +187,24 @@ class KernelBuilder:
         self.add("flow", ("pause",))
         self.add("debug", ("comment", "Starting optimized vectorized loop"))
 
-        # Allocate vector registers for software pipelining
-        # Each buffer needs 6 vectors × 8 words = 48 words
-        # With 1536 scratch, we measured 159 words free with N=24, so try N=27
+        # Allocate vector registers for software pipelining with aggressive reuse
+        # OPTIMIZATION: Only 4 vectors needed per batch (not 6!)
+        # - v_idx, v_val: Core state (must persist)
+        # - v_tmp1, v_tmp2: Reusable temps
+        # - v_addr: Reuse v_tmp1 (only needed between compute and load)
+        # - v_node_val: Reuse v_tmp2 (only needed between load and XOR)
+        # This saves 2 vectors × 8 words = 16 words per batch!
         num_batches = batch_size // VLEN
-        N_PIPELINE = min(27, num_batches)  # Maximize pipeline depth
+        N_PIPELINE = min(32, num_batches)  # Now we can fit all 32!
+
         v_idx = [self.alloc_scratch(f"v_idx_{i}", VLEN) for i in range(N_PIPELINE)]
         v_val = [self.alloc_scratch(f"v_val_{i}", VLEN) for i in range(N_PIPELINE)]
-        v_node_val = [self.alloc_scratch(f"v_node_val_{i}", VLEN) for i in range(N_PIPELINE)]
-        v_addr = [self.alloc_scratch(f"v_addr_{i}", VLEN) for i in range(N_PIPELINE)]
         v_tmp1 = [self.alloc_scratch(f"v_tmp1_{i}", VLEN) for i in range(N_PIPELINE)]
         v_tmp2 = [self.alloc_scratch(f"v_tmp2_{i}", VLEN) for i in range(N_PIPELINE)]
+
+        # Aliases for clarity (these point to the same scratch as tmp1/tmp2)
+        v_addr = v_tmp1  # Computed addresses stored in tmp1
+        v_node_val = v_tmp2  # Node values loaded into tmp2
 
         body = []
 
@@ -338,7 +345,7 @@ class KernelBuilder:
                     buf = group_size - 1
                     body.append(("valu", ("^", v_val[buf], v_val[buf], v_node_val[buf])))
 
-                # Now do all hash stages for all batches (traditional way for now)
+                # Hash stages with pre-broadcast vector constants
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     c1_vec, c3_vec = hash_consts_vec[hi]
 
