@@ -294,6 +294,11 @@ class KernelBuilder:
                         for vi in range(VLEN):
                             body.append(("debug", ("compare", v_node_val[0] + vi, (round, vi, "node_val"))))
 
+                # OPTIMIZATION: Track hash progress per batch to fill idle VALU slots during loads
+                # hash_progress[i] = (stage, phase) where stage is 0-5, phase is 0 (op1+op3) or 1 (op2)
+                # Special value: None means XOR not done yet
+                hash_progress = [None] * group_size
+
                 # Process batches 1+ in a pipeline: Load N, XOR N-1, Hash N-2+
                 for batch_idx in range(1, group_size):
                     buf = batch_idx
@@ -309,24 +314,45 @@ class KernelBuilder:
                         if batch_idx >= 1 and load_idx == 0:
                             prev_buf = batch_idx - 1
                             valu_ops.append(("^", v_val[prev_buf], v_val[prev_buf], v_node_val[prev_buf]))
+                            # Mark this batch as ready for hashing (stage 0, phase 0)
+                            hash_progress[prev_buf] = (0, 0)
 
-                        # If we have batches 2+ steps behind, do hash computation for them
-                        # Hash takes 12 cycles per batch (6 stages × 2 cycles), so spread across the 4 load cycles
-                        hash_batch = batch_idx - 2
-                        if hash_batch >= 0 and hash_batch < group_size:
-                            # Determine which hash stage and phase based on load_idx
-                            # We have 4 load cycles to fill with hash ops
-                            # Each hash stage has 2 phases (op1+op3, then op2)
-                            # 6 stages × 2 phases = 12 total phases
-                            # Map load_idx (0-3) to hash phases for this batch
+                        # Fill remaining VALU slots with hash operations for earlier batches
+                        remaining_slots = 6 - len(valu_ops)
 
-                            # For simplicity, do 3 hash batches per load cycle when possible
-                            hash_stage_base = (batch_idx - 2) % 6  # Which of the 6 stages for this batch
-                            hash_phase = load_idx % 2  # Alternate between op1+op3 and op2
+                        # Try to advance hash computation for batches that are 2+ behind
+                        for lookback in range(2, batch_idx + 1):
+                            if remaining_slots <= 0:
+                                break
 
-                            # Actually, this is getting too complex. Let me simplify:
-                            # Just do what we can fit - hash operations for earlier batches
-                            pass  # Skip for now, do simpler version
+                            hash_batch = batch_idx - lookback
+                            if hash_batch < 0:
+                                break
+
+                            # Can we do hash work for this batch?
+                            if hash_progress[hash_batch] is None:
+                                continue  # XOR not done yet
+
+                            stage_idx, phase = hash_progress[hash_batch]
+                            if stage_idx >= 6:
+                                continue  # All 6 stages done
+
+                            op1, val1, op2, op3, val3 = HASH_STAGES[stage_idx]
+                            c1_vec, c3_vec = hash_consts_vec[stage_idx]
+
+                            if phase == 0:
+                                # Need op1 and op3
+                                if remaining_slots >= 2:
+                                    valu_ops.append((op1, v_tmp1[hash_batch], v_val[hash_batch], c1_vec))
+                                    valu_ops.append((op3, v_tmp2[hash_batch], v_val[hash_batch], c3_vec))
+                                    remaining_slots -= 2
+                                    hash_progress[hash_batch] = (stage_idx, 1)  # Advance to phase 1
+                            else:
+                                # Need op2
+                                if remaining_slots >= 1:
+                                    valu_ops.append((op2, v_val[hash_batch], v_tmp1[hash_batch], v_tmp2[hash_batch]))
+                                    remaining_slots -= 1
+                                    hash_progress[hash_batch] = (stage_idx + 1, 0)  # Advance to next stage
 
                         if valu_ops:
                             body.append(("mega_bundle", {
@@ -344,29 +370,45 @@ class KernelBuilder:
                 if group_size > 0:
                     buf = group_size - 1
                     body.append(("valu", ("^", v_val[buf], v_val[buf], v_node_val[buf])))
+                    # Mark last batch as ready for hashing
+                    hash_progress[buf] = (0, 0)
 
-                # Hash stages with pre-broadcast vector constants
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    c1_vec, c3_vec = hash_consts_vec[hi]
+                # Finish any remaining hash operations that weren't completed during loads
+                # Process batches in order, completing all 6 stages for each
+                for stage_idx in range(6):
+                    op1, val1, op2, op3, val3 = HASH_STAGES[stage_idx]
+                    c1_vec, c3_vec = hash_consts_vec[stage_idx]
 
+                    # Phase 0: op1 and op3 for batches that need it
                     for batch_start in range(0, group_size, 3):
                         ops = []
                         for offset in range(min(3, group_size - batch_start)):
                             buf = batch_start + offset
-                            ops.extend([op1, v_tmp1[buf], v_val[buf], c1_vec])
-                            ops.extend([op3, v_tmp2[buf], v_val[buf], c3_vec])
-                        body.append(("valu_hex", tuple(ops)))
+                            if hash_progress[buf] is not None:
+                                curr_stage, phase = hash_progress[buf]
+                                if curr_stage == stage_idx and phase == 0:
+                                    ops.extend([op1, v_tmp1[buf], v_val[buf], c1_vec])
+                                    ops.extend([op3, v_tmp2[buf], v_val[buf], c3_vec])
+                                    hash_progress[buf] = (stage_idx, 1)
+                        if ops:
+                            body.append(("valu_hex", tuple(ops)))
 
+                    # Phase 1: op2 for batches that need it
                     for batch_start in range(0, group_size, 6):
                         ops = []
                         for offset in range(min(6, group_size - batch_start)):
                             buf = batch_start + offset
-                            ops.extend([op2, v_val[buf], v_tmp1[buf], v_tmp2[buf]])
-                        body.append(("valu_hex", tuple(ops)))
+                            if hash_progress[buf] is not None:
+                                curr_stage, phase = hash_progress[buf]
+                                if curr_stage == stage_idx and phase == 1:
+                                    ops.extend([op2, v_val[buf], v_tmp1[buf], v_tmp2[buf]])
+                                    hash_progress[buf] = (stage_idx + 1, 0)
+                        if ops:
+                            body.append(("valu_hex", tuple(ops)))
 
                     if ENABLE_DEBUG and group_start == 0:
                         for vi in range(VLEN):
-                            body.append(("debug", ("compare", v_val[0] + vi, (round, vi, "hash_stage", hi))))
+                            body.append(("debug", ("compare", v_val[0] + vi, (round, vi, "hash_stage", stage_idx))))
 
                 if ENABLE_DEBUG and group_start == 0:
                     for vi in range(VLEN):
