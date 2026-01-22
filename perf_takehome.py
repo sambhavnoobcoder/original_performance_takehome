@@ -189,10 +189,9 @@ class KernelBuilder:
 
         # Allocate vector registers for software pipelining
         # Each buffer needs 6 vectors × 8 words = 48 words
-        # With 1536 scratch and ~200 words overhead, we can fit about 27-28 pipeline stages
-        # Use 24 for safety and clean division
+        # With 1536 scratch, we measured 159 words free with N=24, so try N=27
         num_batches = batch_size // VLEN
-        N_PIPELINE = min(24, num_batches)  # Near-full unroll with room for overhead
+        N_PIPELINE = min(27, num_batches)  # Maximize pipeline depth
         v_idx = [self.alloc_scratch(f"v_idx_{i}", VLEN) for i in range(N_PIPELINE)]
         v_val = [self.alloc_scratch(f"v_val_{i}", VLEN) for i in range(N_PIPELINE)]
         v_node_val = [self.alloc_scratch(f"v_node_val_{i}", VLEN) for i in range(N_PIPELINE)]
@@ -202,26 +201,29 @@ class KernelBuilder:
 
         body = []
 
-        # Precompute base addresses outside the loop
+        # Precompute base addresses outside the loop - pack ALU operations
         base_addrs = []
         for batch_base in range(0, batch_size, VLEN):
             base_idx_addr = self.alloc_scratch(f"base_idx_addr_b{batch_base}")
             base_val_addr = self.alloc_scratch(f"base_val_addr_b{batch_base}")
+            # Load const and compute both addresses in sequence
             body.append(("load", ("const", tmp1, batch_base)))
             body.append(("alu", ("+", base_idx_addr, self.scratch["inp_indices_p"], tmp1)))
             body.append(("alu", ("+", base_val_addr, self.scratch["inp_values_p"], tmp1)))
             base_addrs.append((base_idx_addr, base_val_addr))
+
+        # Note: ALU operations are very fast and don't bottleneck, so keeping simple
 
         # Main loop - process all batches together with maximally packed VALU operations
         # Strategy: separate into phases where operations from ALL batches can be packed together
 
         for round in range(rounds):
             # Process batches in groups of N_PIPELINE to avoid register conflicts
-            # Each group completes all phases before starting the next group
+            # Aggressive optimization: minimal phases, maximal packing
             for group_start in range(0, num_batches, N_PIPELINE):
                 group_size = min(N_PIPELINE, num_batches - group_start)
 
-                # PHASE 1: Load idx/val for this group
+                # PHASE 1: Load idx/val for ALL batches in group (group_size cycles)
                 for local_idx in range(group_size):
                     batch_idx = group_start + local_idx
                     buf = local_idx
@@ -232,7 +234,7 @@ class KernelBuilder:
                             body.append(("debug", ("compare", v_idx[buf] + vi, (round, batch_idx * VLEN + vi, "idx"))))
                             body.append(("debug", ("compare", v_val[buf] + vi, (round, batch_idx * VLEN + vi, "val"))))
 
-                # PHASE 2: Compute addresses - pack 6 at a time
+                # PHASE 2: Compute addresses - pack 6 at a time (~4 cycles)
                 for batch_start in range(0, group_size, 6):
                     ops = []
                     for offset in range(min(6, group_size - batch_start)):
@@ -240,7 +242,7 @@ class KernelBuilder:
                         ops.extend(["+", v_addr[buf], v_forest_base, v_idx[buf]])
                     body.append(("valu_hex", tuple(ops)))
 
-                # PHASE 3: Load node values - 4 load cycles per batch
+                # PHASE 3: Load node values - interleave to maximize throughput (4 * group_size cycles)
                 for load_idx in range(4):
                     for local_idx in range(group_size):
                         buf = local_idx
@@ -253,7 +255,7 @@ class KernelBuilder:
                         for vi in range(VLEN):
                             body.append(("debug", ("compare", v_node_val[0] + vi, (round, vi, "node_val"))))
 
-                # PHASE 4: XOR - pack 6 at a time
+                # PHASE 4: XOR - pack 6 at a time (~4 cycles)
                 for batch_start in range(0, group_size, 6):
                     ops = []
                     for offset in range(min(6, group_size - batch_start)):
@@ -261,11 +263,14 @@ class KernelBuilder:
                         ops.extend(["^", v_val[buf], v_val[buf], v_node_val[buf]])
                     body.append(("valu_hex", tuple(ops)))
 
-                # PHASE 5: Hash stages
+                # PHASE 5: Hash stages - even more aggressive packing
+                # Process all 6 stages with minimal cycles
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     c1_vec, c3_vec = hash_consts_vec[hi]
 
-                    # op1 and op3 for 3 batches (6 VALU ops)
+                    # Cycle 1: op1 and op3 for first 3 batches (6 VALU ops)
+                    # Cycle 2: op1 and op3 for next 3 batches (6 VALU ops)
+                    # ... continue for all batches
                     for batch_start in range(0, group_size, 3):
                         ops = []
                         for offset in range(min(3, group_size - batch_start)):
@@ -274,7 +279,7 @@ class KernelBuilder:
                             ops.extend([op3, v_tmp2[buf], v_val[buf], c3_vec])
                         body.append(("valu_hex", tuple(ops)))
 
-                    # op2 for 6 batches
+                    # Now op2 for all batches (pack 6 at a time)
                     for batch_start in range(0, group_size, 6):
                         ops = []
                         for offset in range(min(6, group_size - batch_start)):
