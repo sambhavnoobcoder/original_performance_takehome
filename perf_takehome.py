@@ -230,291 +230,113 @@ class KernelBuilder:
             for group_start in range(0, num_batches, N_PIPELINE):
                 group_size = min(N_PIPELINE, num_batches - group_start)
 
-                # PHASE 1+2 MEGA-BUNDLE: Overlap loads with address computation!
-                # Strategy: Load idx/val for batches N through N+5, while computing addresses for batches N-6 through N-1
-
-                # First 6 batches: just loads (no addresses to compute yet)
-                for local_idx in range(min(6, group_size)):
-                    batch_idx = group_start + local_idx
+                # Define tasks for this group
+                tasks = []
+                for local_idx in range(group_size):
                     buf = local_idx
-                    base_idx_addr, base_val_addr = base_addrs[batch_idx]
-                    body.append(("load_vload_pair", (v_idx[buf], base_idx_addr, v_val[buf], base_val_addr)))
-                    if ENABLE_DEBUG and batch_idx == 0:
-                        for vi in range(VLEN):
-                            body.append(("debug", ("compare", v_idx[buf] + vi, (round, batch_idx * VLEN + vi, "idx"))))
-                            body.append(("debug", ("compare", v_val[buf] + vi, (round, batch_idx * VLEN + vi, "val"))))
-
-                # Remaining batches: Load batch N while computing addresses for batches N-6..N-1
-                for local_idx in range(6, group_size):
                     batch_idx = group_start + local_idx
-                    buf = local_idx
                     base_idx_addr, base_val_addr = base_addrs[batch_idx]
 
-                    # Compute which batches to compute addresses for (the 6 batches before current)
-                    addr_ops = []
-                    for addr_offset in range(6):
-                        addr_buf = local_idx - 6 + addr_offset
-                        if addr_buf >= 0:
-                            addr_ops.extend(["+", v_addr[addr_buf], v_forest_base, v_idx[addr_buf]])
+                    # Task for input loads (vload_pair)
+                    input_load_task = {'engine': 'load', 'slot': [("vload", v_idx[buf], base_idx_addr), ("vload", v_val[buf], base_val_addr)], 'deps': [], 'done': False}
+                    tasks.append(input_load_task)
 
-                    if len(addr_ops) == 24:  # 6 ops × 4 elements each
-                        body.append(("mega_bundle", {
-                            "load": [("vload", v_idx[buf], base_idx_addr),
-                                    ("vload", v_val[buf], base_val_addr)],
-                            "valu": [(addr_ops[i], addr_ops[i+1], addr_ops[i+2], addr_ops[i+3])
-                                    for i in range(0, 24, 4)]
-                        }))
-                    else:
-                        # Fallback for incomplete group
-                        body.append(("load_vload_pair", (v_idx[buf], base_idx_addr, v_val[buf], base_val_addr)))
+                    # Task for address computation
+                    addr_task = {'engine': 'valu', 'slot': ("+", v_addr[buf], v_forest_base, v_idx[buf]), 'deps': [input_load_task], 'done': False}
+                    tasks.append(addr_task)
 
-                # Compute addresses for last 6 batches (no more loads to overlap)
-                last_batch_start = max(0, group_size - 6)
-                for batch_start in range(last_batch_start, group_size, 6):
-                    ops = []
-                    for offset in range(min(6, group_size - batch_start)):
-                        buf = batch_start + offset
-                        ops.extend(["+", v_addr[buf], v_forest_base, v_idx[buf]])
-                    if ops:
-                        body.append(("valu_hex", tuple(ops)))
-
-                # PHASE 3+4+5: Stream processing - overlap node loads with hash computation
-                # Load node values for batch N while computing XOR+hash for batch N-1
-
-                # Batch 0: Just load node values (nothing to compute yet)
-                if group_size > 0:
-                    buf = 0
+                    # Tasks for scattered loads (4 load_pairs)
+                    scattered_load_tasks = []
                     for load_idx in range(4):
                         offset = load_idx * 2
-                        body.append(("load_pair", (
-                            v_node_val[buf] + offset, v_addr[buf] + offset,
-                            v_node_val[buf] + offset + 1, v_addr[buf] + offset + 1
-                        )))
-                    if ENABLE_DEBUG and group_start == 0:
-                        for vi in range(VLEN):
-                            body.append(("debug", ("compare", v_node_val[0] + vi, (round, vi, "node_val"))))
+                        scattered_load_task = {'engine': 'load', 'slot': [("load", v_node_val[buf] + offset, v_addr[buf] + offset), ("load", v_node_val[buf] + offset + 1, v_addr[buf] + offset + 1)], 'deps': [addr_task], 'done': False}
+                        tasks.append(scattered_load_task)
+                        scattered_load_tasks.append(scattered_load_task)
 
-                # OPTIMIZATION: Track hash progress per batch to fill idle VALU slots during loads
-                # hash_progress[i] = (stage, phase) where stage is 0-5, phase = 0 (op1+op3) or 1 (op2)
-                # Special value: None means XOR not done yet
-                hash_progress = [None] * group_size
+                    # Task for XOR
+                    xor_task = {'engine': 'valu', 'slot': ("^", v_val[buf], v_val[buf], v_node_val[buf]), 'deps': scattered_load_tasks, 'done': False}
+                    tasks.append(xor_task)
 
-                # NEW: Track next index progress
-                # next_progress[i] = 0-6 for the 6 VALU ops in next index computation
-                next_progress = [0] * group_size
+                    # Tasks for hash stages
+                    previous_hash_task = xor_task
+                    for stage_idx in range(6):
+                        op1, val1, op2, op3, val3 = HASH_STAGES[stage_idx]
+                        c1_vec, c3_vec = hash_consts_vec[stage_idx]
 
-                # NEW: Track store progress
-                # store_progress[i] = 0 not done, 1 done
-                store_progress = [0] * group_size
+                        op1_task = {'engine': 'valu', 'slot': (op1, v_tmp1[buf], v_val[buf], c1_vec), 'deps': [previous_hash_task], 'done': False}
+                        op3_task = {'engine': 'valu', 'slot': (op3, v_tmp2[buf], v_val[buf], c3_vec), 'deps': [previous_hash_task], 'done': False}
+                        tasks.append(op1_task)
+                        tasks.append(op3_task)
 
-                # Process batches 1+ in a pipeline: Load N, XOR N-1, Hash N-2+
-                for batch_idx in range(1, group_size):
-                    buf = batch_idx
+                        op2_task = {'engine': 'valu', 'slot': (op2, v_val[buf], v_tmp1[buf], v_tmp2[buf]), 'deps': [op1_task, op3_task], 'done': False}
+                        tasks.append(op2_task)
 
-                    # Load node values for current batch (4 cycles)
-                    for load_idx in range(4):
-                        offset = load_idx * 2
+                        previous_hash_task = op2_task
 
-                        # Determine what VALU work we can do in parallel
-                        valu_ops = []
+                    # Tasks for next index computation (6 VALU ops)
+                    previous_next_task = previous_hash_task
+                    next_ops = [
+                        ("&", v_tmp1[buf], v_val[buf], v_one),
+                        ("<<", v_tmp2[buf], v_idx[buf], v_one),
+                        ("+", v_tmp1[buf], v_one, v_tmp1[buf]),
+                        ("+", v_idx[buf], v_tmp2[buf], v_tmp1[buf]),
+                        ("<", v_tmp1[buf], v_idx[buf], v_n_nodes),
+                        ("*", v_idx[buf], v_idx[buf], v_tmp1[buf])
+                    ]
+                    for next_slot in next_ops:
+                        next_task = {'engine': 'valu', 'slot': next_slot, 'deps': [previous_next_task], 'done': False}
+                        tasks.append(next_task)
+                        previous_next_task = next_task
 
-                        # If previous batch just finished loading, do its XOR
-                        if batch_idx >= 1 and load_idx == 0:
-                            prev_buf = batch_idx - 1
-                            valu_ops.append(("^", v_val[prev_buf], v_val[prev_buf], v_node_val[prev_buf]))
-                            # Mark this batch as ready for hashing (stage 0, phase 0)
-                            hash_progress[prev_buf] = (0, 0)
+                    # Task for stores (vstore_pair)
+                    store_task = {'engine': 'store', 'slot': [("vstore", base_idx_addr, v_idx[buf]), ("vstore", base_val_addr, v_val[buf])], 'deps': [previous_next_task], 'done': False}
+                    tasks.append(store_task)
 
-                        # Fill remaining VALU slots with hash operations for earlier batches
-                        remaining_slots = 6 - len(valu_ops)
+                # Scheduler loop
+                while any(not t['done'] for t in tasks):
+                    ready = [t for t in tasks if not t['done'] and all(d['done'] for d in t['deps'])]
+                    if not ready:
+                        break
 
-                        # Try to advance hash computation for batches that are 2+ behind
-                        for lookback in range(2, batch_idx + 1):
-                            if remaining_slots <= 0:
-                                break
+                    ready_by_engine = defaultdict(list)
+                    for t in ready:
+                        ready_by_engine[t['engine']].append(t)
 
-                            hash_batch = batch_idx - lookback
-                            if hash_batch < 0:
-                                break
+                    bundle = {}
+                    for engine in ['load', 'store', 'valu']:  # Prioritize load and store
+                        if engine in ready_by_engine:
+                            ready_engine = ready_by_engine[engine]
+                            limit = SLOT_LIMITS[engine]
+                            selected = []
+                            current_slots = 0
+                            for t in ready_engine:
+                                slot_count = len(t['slot']) if isinstance(t['slot'], list) else 1
+                                if current_slots + slot_count <= limit:
+                                    selected.append(t)
+                                    current_slots += slot_count
+                            if selected:
+                                bundle[engine] = []
+                                for t in selected:
+                                    if isinstance(t['slot'], list):
+                                        bundle[engine].extend(t['slot'])
+                                    else:
+                                        bundle[engine].append(t['slot'])
+                                    t['done'] = True
 
-                            # Can we do hash work for this batch?
-                            if hash_progress[hash_batch] is None:
-                                continue  # XOR not done yet
-
-                            stage_idx, phase = hash_progress[hash_batch]
-                            if stage_idx >= 6:
-                                continue  # All 6 stages done
-
-                            op1, val1, op2, op3, val3 = HASH_STAGES[stage_idx]
-                            c1_vec, c3_vec = hash_consts_vec[stage_idx]
-
-                            if phase == 0:
-                                # Need op1 and op3
-                                if remaining_slots >= 2:
-                                    valu_ops.append((op1, v_tmp1[hash_batch], v_val[hash_batch], c1_vec))
-                                    valu_ops.append((op3, v_tmp2[hash_batch], v_val[hash_batch], c3_vec))
-                                    remaining_slots -= 2
-                                    hash_progress[hash_batch] = (stage_idx, 1)  # Advance to phase 1
-                            else:
-                                # Need op2
-                                if remaining_slots >= 1:
-                                    valu_ops.append((op2, v_val[hash_batch], v_tmp1[hash_batch], v_tmp2[hash_batch]))
-                                    remaining_slots -= 1
-                                    hash_progress[hash_batch] = (stage_idx + 1, 0)  # Advance to next stage
-
-                        # NEW: Advance next index computation for batches that have finished hashing
-                        for lookback in range(2, batch_idx + 1):
-                            if remaining_slots <= 0:
-                                break
-
-                            h = batch_idx - lookback
-                            if h < 0:
-                                break
-
-                            if hash_progress[h] == (6, 0) and next_progress[h] < 6:
-                                k = next_progress[h]
-                                if k == 0:
-                                    if remaining_slots >= 1:
-                                        valu_ops.append(("&", v_tmp1[h], v_val[h], v_one))
-                                        next_progress[h] += 1
-                                        remaining_slots -= 1
-                                elif k == 1:
-                                    if remaining_slots >= 1:
-                                        valu_ops.append(("<<", v_tmp2[h], v_idx[h], v_one))
-                                        next_progress[h] += 1
-                                        remaining_slots -= 1
-                                elif k == 2:
-                                    if remaining_slots >= 1:
-                                        valu_ops.append(("+", v_tmp1[h], v_one, v_tmp1[h]))
-                                        next_progress[h] += 1
-                                        remaining_slots -= 1
-                                elif k == 3:
-                                    if remaining_slots >= 1:
-                                        valu_ops.append(("+", v_idx[h], v_tmp2[h], v_tmp1[h]))
-                                        next_progress[h] += 1
-                                        remaining_slots -= 1
-                                elif k == 4:
-                                    if remaining_slots >= 1:
-                                        valu_ops.append(("<", v_tmp1[h], v_idx[h], v_n_nodes))
-                                        next_progress[h] += 1
-                                        remaining_slots -= 1
-                                elif k == 5:
-                                    if remaining_slots >= 1:
-                                        valu_ops.append(("*", v_idx[h], v_idx[h], v_tmp1[h]))
-                                        next_progress[h] += 1
-                                        remaining_slots -= 1
-
-                        # Build the bundle
-                        bundle = {}
-                        bundle["load"] = [("load", v_node_val[buf] + offset, v_addr[buf] + offset),
-                                          ("load", v_node_val[buf] + offset + 1, v_addr[buf] + offset + 1)]
-
-                        if valu_ops:
-                            bundle["valu"] = valu_ops
-
-                        # NEW: Add stores for batches that have finished next index
-                        store_ops = []
-                        for lookback in range(2, batch_idx + 1):
-                            h = batch_idx - lookback
-                            if h < 0:
-                                break
-                            if next_progress[h] == 6 and store_progress[h] == 0:
-                                batch_idx_store = group_start + h
-                                base_idx_addr, base_val_addr = base_addrs[batch_idx_store]
-                                store_ops = [("vstore", base_idx_addr, v_idx[h]), ("vstore", base_val_addr, v_val[h])]
-                                store_progress[h] = 1
-                                break  # Only one pair per cycle since 2 slots
-
-                        if store_ops:
-                            bundle["store"] = store_ops
-
+                    if bundle:
                         body.append(("mega_bundle", bundle))
 
-                # XOR for last batch (nothing loading anymore)
-                if group_size > 0:
-                    buf = group_size - 1
-                    body.append(("valu", ("^", v_val[buf], v_val[buf], v_node_val[buf])))
-                    # Mark last batch as ready for hashing
-                    hash_progress[buf] = (0, 0)
-
-                # Finish any remaining hash operations that weren't completed during loads
-                # Process batches in order, completing all 6 stages for each
-                for stage_idx in range(6):
-                    op1, val1, op2, op3, val3 = HASH_STAGES[stage_idx]
-                    c1_vec, c3_vec = hash_consts_vec[stage_idx]
-
-                    # Phase 0: op1 and op3 for batches that need it
-                    for batch_start in range(0, group_size, 3):
-                        ops = []
-                        for offset in range(min(3, group_size - batch_start)):
-                            buf = batch_start + offset
-                            if hash_progress[buf] is not None:
-                                curr_stage, phase = hash_progress[buf]
-                                if curr_stage == stage_idx and phase == 0:
-                                    ops.extend([op1, v_tmp1[buf], v_val[buf], c1_vec])
-                                    ops.extend([op3, v_tmp2[buf], v_val[buf], c3_vec])
-                                    hash_progress[buf] = (stage_idx, 1)
-                        if ops:
-                            body.append(("valu_hex", tuple(ops)))
-
-                    # Phase 1: op2 for batches that need it
-                    for batch_start in range(0, group_size, 6):
-                        ops = []
-                        for offset in range(min(6, group_size - batch_start)):
-                            buf = batch_start + offset
-                            if hash_progress[buf] is not None:
-                                curr_stage, phase = hash_progress[buf]
-                                if curr_stage == stage_idx and phase == 1:
-                                    ops.extend([op2, v_val[buf], v_tmp1[buf], v_tmp2[buf]])
-                                    hash_progress[buf] = (stage_idx + 1, 0)
-                        if ops:
-                            body.append(("valu_hex", tuple(ops)))
-
-                    if ENABLE_DEBUG and group_start == 0:
-                        for vi in range(VLEN):
-                            body.append(("debug", ("compare", v_val[0] + vi, (round, vi, "hash_stage", stage_idx))))
-
+                # Add debug compares if enabled
                 if ENABLE_DEBUG and group_start == 0:
                     for vi in range(VLEN):
+                        body.append(("debug", ("compare", v_idx[0] + vi, (round, vi, "idx"))))
+                        body.append(("debug", ("compare", v_val[0] + vi, (round, vi, "val"))))
+                        body.append(("debug", ("compare", v_node_val[0] + vi, (round, vi, "node_val"))))
+                        for hi in range(len(HASH_STAGES)):
+                            body.append(("debug", ("compare", v_val[0] + vi, (round, vi, "hash_stage", hi))))
                         body.append(("debug", ("compare", v_val[0] + vi, (round, vi, "hashed_val"))))
-
-                # NEW: Finish any remaining next index operations with packed packing
-                for next_op_type in range(6):
-                    ops = []
-                    for buf in range(group_size):
-                        if next_progress[buf] == next_op_type:
-                            if next_op_type == 0:
-                                ops.extend(["&", v_tmp1[buf], v_val[buf], v_one])
-                            elif next_op_type == 1:
-                                ops.extend(["<<", v_tmp2[buf], v_idx[buf], v_one])
-                            elif next_op_type == 2:
-                                ops.extend(["+", v_tmp1[buf], v_one, v_tmp1[buf]])
-                            elif next_op_type == 3:
-                                ops.extend(["+", v_idx[buf], v_tmp2[buf], v_tmp1[buf]])
-                            elif next_op_type == 4:
-                                ops.extend(["<", v_tmp1[buf], v_idx[buf], v_n_nodes])
-                            elif next_op_type == 5:
-                                ops.extend(["*", v_idx[buf], v_idx[buf], v_tmp1[buf]])
-                            next_progress[buf] += 1
-                            if len(ops) == 24:  # 6*4
-                                body.append(("valu_hex", tuple(ops)))
-                                ops = []
-                    if ops:
-                        body.append(("valu_hex", tuple(ops)))
-
-                if ENABLE_DEBUG and group_start == 0:
-                    for vi in range(VLEN):
                         body.append(("debug", ("compare", v_idx[0] + vi, (round, vi, "next_idx"))))
                         body.append(("debug", ("compare", v_idx[0] + vi, (round, vi, "wrapped_idx"))))
-
-                # NEW: Finish any remaining stores
-                for local_idx in range(group_size):
-                    if next_progress[local_idx] == 6 and store_progress[local_idx] == 0:
-                        batch_idx = group_start + local_idx
-                        buf = local_idx
-                        base_idx_addr, base_val_addr = base_addrs[batch_idx]
-                        body.append(("store_vstore_pair", (base_idx_addr, v_idx[buf], base_val_addr, v_val[buf])))
-                        store_progress[local_idx] = 1
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
@@ -593,7 +415,7 @@ class Tests(unittest.TestCase):
         do_kernel_test(10, 16, 256, trace=True, prints=False)
 
     # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
-    # You can uncomment this if you think it might help you debug
+    # You can uncomment this check for debugging
     # def test_kernel_correctness(self):
     #     for batch in range(1, 3):
     #         for forest_height in range(3):
