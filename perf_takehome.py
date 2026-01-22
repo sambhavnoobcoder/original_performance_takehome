@@ -295,9 +295,17 @@ class KernelBuilder:
                             body.append(("debug", ("compare", v_node_val[0] + vi, (round, vi, "node_val"))))
 
                 # OPTIMIZATION: Track hash progress per batch to fill idle VALU slots during loads
-                # hash_progress[i] = (stage, phase) where stage is 0-5, phase is 0 (op1+op3) or 1 (op2)
+                # hash_progress[i] = (stage, phase) where stage is 0-5, phase = 0 (op1+op3) or 1 (op2)
                 # Special value: None means XOR not done yet
                 hash_progress = [None] * group_size
+
+                # NEW: Track next index progress
+                # next_progress[i] = 0-6 for the 6 VALU ops in next index computation
+                next_progress = [0] * group_size
+
+                # NEW: Track store progress
+                # store_progress[i] = 0 not done, 1 done
+                store_progress = [0] * group_size
 
                 # Process batches 1+ in a pipeline: Load N, XOR N-1, Hash N-2+
                 for batch_idx in range(1, group_size):
@@ -354,17 +362,73 @@ class KernelBuilder:
                                     remaining_slots -= 1
                                     hash_progress[hash_batch] = (stage_idx + 1, 0)  # Advance to next stage
 
+                        # NEW: Advance next index computation for batches that have finished hashing
+                        for lookback in range(2, batch_idx + 1):
+                            if remaining_slots <= 0:
+                                break
+
+                            h = batch_idx - lookback
+                            if h < 0:
+                                break
+
+                            if hash_progress[h] == (6, 0) and next_progress[h] < 6:
+                                k = next_progress[h]
+                                if k == 0:
+                                    if remaining_slots >= 1:
+                                        valu_ops.append(("&", v_tmp1[h], v_val[h], v_one))
+                                        next_progress[h] += 1
+                                        remaining_slots -= 1
+                                elif k == 1:
+                                    if remaining_slots >= 1:
+                                        valu_ops.append(("<<", v_tmp2[h], v_idx[h], v_one))
+                                        next_progress[h] += 1
+                                        remaining_slots -= 1
+                                elif k == 2:
+                                    if remaining_slots >= 1:
+                                        valu_ops.append(("+", v_tmp1[h], v_one, v_tmp1[h]))
+                                        next_progress[h] += 1
+                                        remaining_slots -= 1
+                                elif k == 3:
+                                    if remaining_slots >= 1:
+                                        valu_ops.append(("+", v_idx[h], v_tmp2[h], v_tmp1[h]))
+                                        next_progress[h] += 1
+                                        remaining_slots -= 1
+                                elif k == 4:
+                                    if remaining_slots >= 1:
+                                        valu_ops.append(("<", v_tmp1[h], v_idx[h], v_n_nodes))
+                                        next_progress[h] += 1
+                                        remaining_slots -= 1
+                                elif k == 5:
+                                    if remaining_slots >= 1:
+                                        valu_ops.append(("*", v_idx[h], v_idx[h], v_tmp1[h]))
+                                        next_progress[h] += 1
+                                        remaining_slots -= 1
+
+                        # Build the bundle
+                        bundle = {}
+                        bundle["load"] = [("load", v_node_val[buf] + offset, v_addr[buf] + offset),
+                                          ("load", v_node_val[buf] + offset + 1, v_addr[buf] + offset + 1)]
+
                         if valu_ops:
-                            body.append(("mega_bundle", {
-                                "load": [("load", v_node_val[buf] + offset, v_addr[buf] + offset),
-                                        ("load", v_node_val[buf] + offset + 1, v_addr[buf] + offset + 1)],
-                                "valu": valu_ops
-                            }))
-                        else:
-                            body.append(("load_pair", (
-                                v_node_val[buf] + offset, v_addr[buf] + offset,
-                                v_node_val[buf] + offset + 1, v_addr[buf] + offset + 1
-                            )))
+                            bundle["valu"] = valu_ops
+
+                        # NEW: Add stores for batches that have finished next index
+                        store_ops = []
+                        for lookback in range(2, batch_idx + 1):
+                            h = batch_idx - lookback
+                            if h < 0:
+                                break
+                            if next_progress[h] == 6 and store_progress[h] == 0:
+                                batch_idx_store = group_start + h
+                                base_idx_addr, base_val_addr = base_addrs[batch_idx_store]
+                                store_ops = [("vstore", base_idx_addr, v_idx[h]), ("vstore", base_val_addr, v_val[h])]
+                                store_progress[h] = 1
+                                break  # Only one pair per cycle since 2 slots
+
+                        if store_ops:
+                            bundle["store"] = store_ops
+
+                        body.append(("mega_bundle", bundle))
 
                 # XOR for last batch (nothing loading anymore)
                 if group_size > 0:
@@ -414,58 +478,42 @@ class KernelBuilder:
                     for vi in range(VLEN):
                         body.append(("debug", ("compare", v_val[0] + vi, (round, vi, "hashed_val"))))
 
-                # PHASE 6: Compute next index
-                for batch_start in range(0, group_size, 3):
-                    ops = []
-                    for offset in range(min(3, group_size - batch_start)):
-                        buf = batch_start + offset
-                        ops.extend(["&", v_tmp1[buf], v_val[buf], v_one])
-                        ops.extend(["<<", v_tmp2[buf], v_idx[buf], v_one])
-                    body.append(("valu_hex", tuple(ops)))
-
-                for batch_start in range(0, group_size, 6):
-                    ops = []
-                    for offset in range(min(6, group_size - batch_start)):
-                        buf = batch_start + offset
-                        ops.extend(["+", v_tmp1[buf], v_one, v_tmp1[buf]])
-                    body.append(("valu_hex", tuple(ops)))
-
-                for batch_start in range(0, group_size, 6):
-                    ops = []
-                    for offset in range(min(6, group_size - batch_start)):
-                        buf = batch_start + offset
-                        ops.extend(["+", v_idx[buf], v_tmp2[buf], v_tmp1[buf]])
-                    body.append(("valu_hex", tuple(ops)))
+                # NEW: Finish any remaining next index operations
+                for next_step in range(6):
+                    for batch_start in range(0, group_size, 6):
+                        ops = []
+                        for offset in range(min(6, group_size - batch_start)):
+                            buf = batch_start + offset
+                            if hash_progress[buf] == (6, 0) and next_progress[buf] == next_step:
+                                if next_step == 0:
+                                    ops.extend(["&", v_tmp1[buf], v_val[buf], v_one])
+                                elif next_step == 1:
+                                    ops.extend(["<<", v_tmp2[buf], v_idx[buf], v_one])
+                                elif next_step == 2:
+                                    ops.extend(["+", v_tmp1[buf], v_one, v_tmp1[buf]])
+                                elif next_step == 3:
+                                    ops.extend(["+", v_idx[buf], v_tmp2[buf], v_tmp1[buf]])
+                                elif next_step == 4:
+                                    ops.extend(["<", v_tmp1[buf], v_idx[buf], v_n_nodes])
+                                elif next_step == 5:
+                                    ops.extend(["*", v_idx[buf], v_idx[buf], v_tmp1[buf]])
+                                next_progress[buf] += 1
+                        if ops:
+                            body.append(("valu_hex", tuple(ops)))
 
                 if ENABLE_DEBUG and group_start == 0:
                     for vi in range(VLEN):
                         body.append(("debug", ("compare", v_idx[0] + vi, (round, vi, "next_idx"))))
-
-                # PHASE 7: Wrap indices
-                for batch_start in range(0, group_size, 6):
-                    ops = []
-                    for offset in range(min(6, group_size - batch_start)):
-                        buf = batch_start + offset
-                        ops.extend(["<", v_tmp1[buf], v_idx[buf], v_n_nodes])
-                    body.append(("valu_hex", tuple(ops)))
-
-                for batch_start in range(0, group_size, 6):
-                    ops = []
-                    for offset in range(min(6, group_size - batch_start)):
-                        buf = batch_start + offset
-                        ops.extend(["*", v_idx[buf], v_idx[buf], v_tmp1[buf]])
-                    body.append(("valu_hex", tuple(ops)))
-
-                if ENABLE_DEBUG and group_start == 0:
-                    for vi in range(VLEN):
                         body.append(("debug", ("compare", v_idx[0] + vi, (round, vi, "wrapped_idx"))))
 
-                # PHASE 8: Store results for this group
+                # NEW: Finish any remaining stores
                 for local_idx in range(group_size):
-                    batch_idx = group_start + local_idx
-                    buf = local_idx
-                    base_idx_addr, base_val_addr = base_addrs[batch_idx]
-                    body.append(("store_vstore_pair", (base_idx_addr, v_idx[buf], base_val_addr, v_val[buf])))
+                    if next_progress[local_idx] == 6 and store_progress[local_idx] == 0:
+                        batch_idx = group_start + local_idx
+                        buf = local_idx
+                        base_idx_addr, base_val_addr = base_addrs[batch_idx]
+                        body.append(("store_vstore_pair", (base_idx_addr, v_idx[buf], base_val_addr, v_val[buf])))
+                        store_progress[local_idx] = 1
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
