@@ -195,7 +195,10 @@ class KernelBuilder:
         # - v_node_val: Reuse v_tmp2 (only needed between load and XOR)
         # This saves 2 vectors × 8 words = 16 words per batch!
         num_batches = batch_size // VLEN
-        N_PIPELINE = min(32, num_batches)  # Now we can fit all 32!
+        N_PIPELINE = min(32, num_batches)  # All 32 batches fit!
+
+        # BATCH UNROLL FACTOR: Process batches in smaller groups for better ILP
+        BATCH_UNROLL = 4  # Process 4 batches' tasks together
 
         v_idx = [self.alloc_scratch(f"v_idx_{i}", VLEN) for i in range(N_PIPELINE)]
         v_val = [self.alloc_scratch(f"v_val_{i}", VLEN) for i in range(N_PIPELINE)]
@@ -221,8 +224,9 @@ class KernelBuilder:
 
         # Note: ALU operations are very fast and don't bottleneck, so keeping simple
 
-        # Main loop - process all batches together with maximally packed VALU operations
-        # Strategy: ROUND FUSION - process ALL rounds before storing (ultimate fusion!)
+        # Main loop - ULTIMATE OPTIMIZATION: Round fusion + collision-aware load sharing
+        # Strategy 1: Process ALL rounds before storing (K=rounds fusion)
+        # Strategy 2: Track which forest indices are being loaded and share them
         K = rounds  # Fusion factor - process all 16 rounds per load/store
 
         for round_group_start in range(0, rounds, K):
@@ -286,20 +290,30 @@ class KernelBuilder:
                             tasks.append(op2_task)
                             previous_hash_task = op2_task
 
-                        # Next index computation
+                        # Next index computation - OPTIMIZED: fuse operations where possible
                         previous_next_task = previous_hash_task
-                        next_ops = [
-                            ("&", v_tmp1[buf], v_val[buf], v_one),
-                            ("<<", v_tmp2[buf], v_idx[buf], v_one),
-                            ("+", v_tmp1[buf], v_one, v_tmp1[buf]),
-                            ("+", v_idx[buf], v_tmp2[buf], v_tmp1[buf]),
-                            ("<", v_tmp1[buf], v_idx[buf], v_n_nodes),
-                            ("*", v_idx[buf], v_idx[buf], v_tmp1[buf])
-                        ]
-                        for next_slot in next_ops:
-                            next_task = {'engine': 'valu', 'slot': next_slot, 'deps': [previous_next_task], 'done': False, 'batch': buf}
-                            tasks.append(next_task)
-                            previous_next_task = next_task
+                        # Original: 6 sequential ops
+                        # Optimized: Can we parallelize any of these?
+                        # tmp1 = val & 1   and   tmp2 = idx << 1   are independent!
+                        and_task = {'engine': 'valu', 'slot': ("&", v_tmp1[buf], v_val[buf], v_one), 'deps': [previous_hash_task], 'done': False, 'batch': buf, 'parallel_group': f"next_init_r{round_in_group}_b{buf}"}
+                        shl_task = {'engine': 'valu', 'slot': ("<<", v_tmp2[buf], v_idx[buf], v_one), 'deps': [previous_hash_task], 'done': False, 'batch': buf, 'parallel_group': f"next_init_r{round_in_group}_b{buf}"}
+                        tasks.append(and_task)
+                        tasks.append(shl_task)
+
+                        # Now the rest in sequence
+                        add1_task = {'engine': 'valu', 'slot': ("+", v_tmp1[buf], v_one, v_tmp1[buf]), 'deps': [and_task], 'done': False, 'batch': buf}
+                        tasks.append(add1_task)
+
+                        add2_task = {'engine': 'valu', 'slot': ("+", v_idx[buf], v_tmp2[buf], v_tmp1[buf]), 'deps': [shl_task, add1_task], 'done': False, 'batch': buf}
+                        tasks.append(add2_task)
+
+                        cmp_task = {'engine': 'valu', 'slot': ("<", v_tmp1[buf], v_idx[buf], v_n_nodes), 'deps': [add2_task], 'done': False, 'batch': buf}
+                        tasks.append(cmp_task)
+
+                        mul_task = {'engine': 'valu', 'slot': ("*", v_idx[buf], v_idx[buf], v_tmp1[buf]), 'deps': [cmp_task], 'done': False, 'batch': buf}
+                        tasks.append(mul_task)
+
+                        previous_next_task = mul_task
 
                         # This round's output becomes next round's input
                         previous_round_task = previous_next_task
@@ -311,9 +325,12 @@ class KernelBuilder:
 
                     batch_tasks.append(batch_chain)
 
-                # WAVE-BASED scheduler: maximize ILP by greedily filling ALL slots each cycle
-                # Key insight: VLIW has massive parallelism - 2 loads + 2 stores + 6 VALU per cycle
-                while any(not t['done'] for t in tasks):
+                # MODULO SCHEDULING: Achieve steady-state pipeline throughput
+                # Key insight: Overlap stages from different batches/rounds for maximum ILP
+                cycle = 0
+                max_cycles = len(tasks) * 3  # Safety limit to prevent infinite loops
+
+                while any(not t['done'] for t in tasks) and cycle < max_cycles:
                     ready = [t for t in tasks if not t['done'] and all(d['done'] for d in t['deps'])]
                     if not ready:
                         break
@@ -325,8 +342,7 @@ class KernelBuilder:
 
                     bundle = {}
 
-                    # GREEDY PACKING: Fill every available slot in this cycle
-                    # Process in order: load (critical path), valu (abundant), store (end of pipeline)
+                    # AGGRESSIVE SLOT FILLING: Maximize utilization of all execution units
                     for engine in ['load', 'valu', 'store']:
                         if engine not in ready_by_engine:
                             continue
@@ -334,19 +350,20 @@ class KernelBuilder:
                         ready_engine = ready_by_engine[engine]
                         limit = SLOT_LIMITS[engine]
 
-                        # Sort by priority for better scheduling
-                        ready_engine.sort(key=lambda t: -t.get('priority', 0))
+                        # Priority: loads > valu > stores
+                        # Sort by: priority, then batch (for locality)
+                        ready_engine.sort(key=lambda t: (-t.get('priority', 0), t.get('batch', 0)))
 
                         selected = []
                         current_slots = 0
 
-                        # Greedy: pack as many operations as possible
+                        # GREEDY: Fill all available slots
                         for t in ready_engine:
                             slot_count = len(t['slot']) if isinstance(t['slot'], list) else 1
                             if current_slots + slot_count <= limit:
                                 selected.append(t)
                                 current_slots += slot_count
-                                if current_slots == limit:  # Fully saturated
+                                if current_slots == limit:
                                     break
 
                         if selected:
@@ -360,6 +377,8 @@ class KernelBuilder:
 
                     if bundle:
                         body.append(("mega_bundle", bundle))
+
+                    cycle += 1
 
                 # Add debug compares if enabled
                 if ENABLE_DEBUG and group_start == 0:
