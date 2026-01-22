@@ -478,28 +478,29 @@ class KernelBuilder:
                     for vi in range(VLEN):
                         body.append(("debug", ("compare", v_val[0] + vi, (round, vi, "hashed_val"))))
 
-                # NEW: Finish any remaining next index operations
-                for next_step in range(6):
-                    for batch_start in range(0, group_size, 6):
-                        ops = []
-                        for offset in range(min(6, group_size - batch_start)):
-                            buf = batch_start + offset
-                            if hash_progress[buf] == (6, 0) and next_progress[buf] == next_step:
-                                if next_step == 0:
-                                    ops.extend(["&", v_tmp1[buf], v_val[buf], v_one])
-                                elif next_step == 1:
-                                    ops.extend(["<<", v_tmp2[buf], v_idx[buf], v_one])
-                                elif next_step == 2:
-                                    ops.extend(["+", v_tmp1[buf], v_one, v_tmp1[buf]])
-                                elif next_step == 3:
-                                    ops.extend(["+", v_idx[buf], v_tmp2[buf], v_tmp1[buf]])
-                                elif next_step == 4:
-                                    ops.extend(["<", v_tmp1[buf], v_idx[buf], v_n_nodes])
-                                elif next_step == 5:
-                                    ops.extend(["*", v_idx[buf], v_idx[buf], v_tmp1[buf]])
-                                next_progress[buf] += 1
-                        if ops:
-                            body.append(("valu_hex", tuple(ops)))
+                # NEW: Finish any remaining next index operations with packed packing
+                for next_op_type in range(6):
+                    ops = []
+                    for buf in range(group_size):
+                        if next_progress[buf] == next_op_type:
+                            if next_op_type == 0:
+                                ops.extend(["&", v_tmp1[buf], v_val[buf], v_one])
+                            elif next_op_type == 1:
+                                ops.extend(["<<", v_tmp2[buf], v_idx[buf], v_one])
+                            elif next_op_type == 2:
+                                ops.extend(["+", v_tmp1[buf], v_one, v_tmp1[buf]])
+                            elif next_op_type == 3:
+                                ops.extend(["+", v_idx[buf], v_tmp2[buf], v_tmp1[buf]])
+                            elif next_op_type == 4:
+                                ops.extend(["<", v_tmp1[buf], v_idx[buf], v_n_nodes])
+                            elif next_op_type == 5:
+                                ops.extend(["*", v_idx[buf], v_idx[buf], v_tmp1[buf]])
+                            next_progress[buf] += 1
+                            if len(ops) == 24:  # 6*4
+                                body.append(("valu_hex", tuple(ops)))
+                                ops = []
+                    if ops:
+                        body.append(("valu_hex", tuple(ops)))
 
                 if ENABLE_DEBUG and group_start == 0:
                     for vi in range(VLEN):
