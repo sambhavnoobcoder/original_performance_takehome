@@ -223,8 +223,11 @@ class KernelBuilder:
             for group_start in range(0, num_batches, N_PIPELINE):
                 group_size = min(N_PIPELINE, num_batches - group_start)
 
-                # PHASE 1: Load idx/val for ALL batches in group (group_size cycles)
-                for local_idx in range(group_size):
+                # PHASE 1+2 MEGA-BUNDLE: Overlap loads with address computation!
+                # Strategy: Load idx/val for batches N through N+5, while computing addresses for batches N-6 through N-1
+
+                # First 6 batches: just loads (no addresses to compute yet)
+                for local_idx in range(min(6, group_size)):
                     batch_idx = group_start + local_idx
                     buf = local_idx
                     base_idx_addr, base_val_addr = base_addrs[batch_idx]
@@ -234,43 +237,111 @@ class KernelBuilder:
                             body.append(("debug", ("compare", v_idx[buf] + vi, (round, batch_idx * VLEN + vi, "idx"))))
                             body.append(("debug", ("compare", v_val[buf] + vi, (round, batch_idx * VLEN + vi, "val"))))
 
-                # PHASE 2: Compute addresses - pack 6 at a time (~4 cycles)
-                for batch_start in range(0, group_size, 6):
+                # Remaining batches: Load batch N while computing addresses for batches N-6..N-1
+                for local_idx in range(6, group_size):
+                    batch_idx = group_start + local_idx
+                    buf = local_idx
+                    base_idx_addr, base_val_addr = base_addrs[batch_idx]
+
+                    # Compute which batches to compute addresses for (the 6 batches before current)
+                    addr_ops = []
+                    for addr_offset in range(6):
+                        addr_buf = local_idx - 6 + addr_offset
+                        if addr_buf >= 0:
+                            addr_ops.extend(["+", v_addr[addr_buf], v_forest_base, v_idx[addr_buf]])
+
+                    if len(addr_ops) == 24:  # 6 ops × 4 elements each
+                        body.append(("mega_bundle", {
+                            "load": [("vload", v_idx[buf], base_idx_addr),
+                                    ("vload", v_val[buf], base_val_addr)],
+                            "valu": [(addr_ops[i], addr_ops[i+1], addr_ops[i+2], addr_ops[i+3])
+                                    for i in range(0, 24, 4)]
+                        }))
+                    else:
+                        # Fallback for incomplete group
+                        body.append(("load_vload_pair", (v_idx[buf], base_idx_addr, v_val[buf], base_val_addr)))
+
+                # Compute addresses for last 6 batches (no more loads to overlap)
+                last_batch_start = max(0, group_size - 6)
+                for batch_start in range(last_batch_start, group_size, 6):
                     ops = []
                     for offset in range(min(6, group_size - batch_start)):
                         buf = batch_start + offset
                         ops.extend(["+", v_addr[buf], v_forest_base, v_idx[buf]])
-                    body.append(("valu_hex", tuple(ops)))
+                    if ops:
+                        body.append(("valu_hex", tuple(ops)))
 
-                # PHASE 3: Load node values - interleave to maximize throughput (4 * group_size cycles)
-                for load_idx in range(4):
-                    for local_idx in range(group_size):
-                        buf = local_idx
+                # PHASE 3+4+5: Stream processing - overlap node loads with hash computation
+                # Load node values for batch N while computing XOR+hash for batch N-1
+
+                # Batch 0: Just load node values (nothing to compute yet)
+                if group_size > 0:
+                    buf = 0
+                    for load_idx in range(4):
                         offset = load_idx * 2
                         body.append(("load_pair", (
                             v_node_val[buf] + offset, v_addr[buf] + offset,
                             v_node_val[buf] + offset + 1, v_addr[buf] + offset + 1
                         )))
-                    if ENABLE_DEBUG and load_idx == 3 and group_start == 0:
+                    if ENABLE_DEBUG and group_start == 0:
                         for vi in range(VLEN):
                             body.append(("debug", ("compare", v_node_val[0] + vi, (round, vi, "node_val"))))
 
-                # PHASE 4: XOR - pack 6 at a time (~4 cycles)
-                for batch_start in range(0, group_size, 6):
-                    ops = []
-                    for offset in range(min(6, group_size - batch_start)):
-                        buf = batch_start + offset
-                        ops.extend(["^", v_val[buf], v_val[buf], v_node_val[buf]])
-                    body.append(("valu_hex", tuple(ops)))
+                # Process batches 1+ in a pipeline: Load N, XOR N-1, Hash N-2+
+                for batch_idx in range(1, group_size):
+                    buf = batch_idx
 
-                # PHASE 5: Hash stages - even more aggressive packing
-                # Process all 6 stages with minimal cycles
+                    # Load node values for current batch (4 cycles)
+                    for load_idx in range(4):
+                        offset = load_idx * 2
+
+                        # Determine what VALU work we can do in parallel
+                        valu_ops = []
+
+                        # If previous batch just finished loading, do its XOR
+                        if batch_idx >= 1 and load_idx == 0:
+                            prev_buf = batch_idx - 1
+                            valu_ops.append(("^", v_val[prev_buf], v_val[prev_buf], v_node_val[prev_buf]))
+
+                        # If we have batches 2+ steps behind, do hash computation for them
+                        # Hash takes 12 cycles per batch (6 stages × 2 cycles), so spread across the 4 load cycles
+                        hash_batch = batch_idx - 2
+                        if hash_batch >= 0 and hash_batch < group_size:
+                            # Determine which hash stage and phase based on load_idx
+                            # We have 4 load cycles to fill with hash ops
+                            # Each hash stage has 2 phases (op1+op3, then op2)
+                            # 6 stages × 2 phases = 12 total phases
+                            # Map load_idx (0-3) to hash phases for this batch
+
+                            # For simplicity, do 3 hash batches per load cycle when possible
+                            hash_stage_base = (batch_idx - 2) % 6  # Which of the 6 stages for this batch
+                            hash_phase = load_idx % 2  # Alternate between op1+op3 and op2
+
+                            # Actually, this is getting too complex. Let me simplify:
+                            # Just do what we can fit - hash operations for earlier batches
+                            pass  # Skip for now, do simpler version
+
+                        if valu_ops:
+                            body.append(("mega_bundle", {
+                                "load": [("load", v_node_val[buf] + offset, v_addr[buf] + offset),
+                                        ("load", v_node_val[buf] + offset + 1, v_addr[buf] + offset + 1)],
+                                "valu": valu_ops
+                            }))
+                        else:
+                            body.append(("load_pair", (
+                                v_node_val[buf] + offset, v_addr[buf] + offset,
+                                v_node_val[buf] + offset + 1, v_addr[buf] + offset + 1
+                            )))
+
+                # XOR for last batch (nothing loading anymore)
+                if group_size > 0:
+                    buf = group_size - 1
+                    body.append(("valu", ("^", v_val[buf], v_val[buf], v_node_val[buf])))
+
+                # Now do all hash stages for all batches (traditional way for now)
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     c1_vec, c3_vec = hash_consts_vec[hi]
 
-                    # Cycle 1: op1 and op3 for first 3 batches (6 VALU ops)
-                    # Cycle 2: op1 and op3 for next 3 batches (6 VALU ops)
-                    # ... continue for all batches
                     for batch_start in range(0, group_size, 3):
                         ops = []
                         for offset in range(min(3, group_size - batch_start)):
@@ -279,7 +350,6 @@ class KernelBuilder:
                             ops.extend([op3, v_tmp2[buf], v_val[buf], c3_vec])
                         body.append(("valu_hex", tuple(ops)))
 
-                    # Now op2 for all batches (pack 6 at a time)
                     for batch_start in range(0, group_size, 6):
                         ops = []
                         for offset in range(min(6, group_size - batch_start)):
