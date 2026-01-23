@@ -34,6 +34,118 @@ from problem import (
 )
 
 
+def _vec_range(base: int, length: int = VLEN) -> range:
+    """Get the range of addresses for a vector."""
+    return range(base, base + length)
+
+
+def _slot_rw(engine: str, slot: tuple) -> tuple[list[int], list[int]]:
+    """Get read and write addresses for a slot operation."""
+    reads = []
+    writes = []
+
+    if engine == "load":
+        op = slot[0]
+        if op == "const":
+            _, dest, _ = slot
+            writes.append(dest)
+        elif op == "load":
+            _, dest, addr = slot
+            reads.append(addr)
+            writes.append(dest)
+        elif op == "vload":
+            _, dest, addr = slot
+            reads.append(addr)
+            writes.extend(_vec_range(dest))
+    elif engine == "store":
+        op = slot[0]
+        if op == "store":
+            _, addr, src = slot
+            reads.extend([addr, src])
+        elif op == "vstore":
+            _, addr, src = slot
+            reads.append(addr)
+            reads.extend(_vec_range(src))
+    elif engine == "alu":
+        op, dest, *args = slot
+        reads.extend(args)
+        writes.append(dest)
+    elif engine == "valu":
+        op = slot[0]
+        if op == "vbroadcast":
+            _, dest, src = slot
+            reads.append(src)
+            writes.extend(_vec_range(dest))
+        elif op == "multiply_add":
+            _, dest, src1, src2, src3 = slot
+            reads.extend(_vec_range(src1))
+            reads.extend(_vec_range(src2))
+            reads.extend(_vec_range(src3))
+            writes.extend(_vec_range(dest))
+        else:
+            _, dest, *args = slot
+            for arg in args:
+                reads.extend(_vec_range(arg))
+            writes.extend(_vec_range(dest))
+    elif engine == "flow":
+        op = slot[0]
+        if op == "add_imm":
+            _, dest, src, _ = slot
+            reads.append(src)
+            writes.append(dest)
+        elif op in ["pause", "halt"]:
+            pass
+
+    return reads, writes
+
+
+def _schedule_slots(slots: list[tuple[str, tuple]]) -> list[dict[str, list[tuple]]]:
+    """
+    Automatically schedule operations into VLIW bundles respecting dependencies.
+    """
+    cycles = []
+    usage = []
+    ready_time = defaultdict(int)
+    last_write = defaultdict(lambda: -1)
+    last_read = defaultdict(lambda: -1)
+
+    def ensure_cycle(cycle: int) -> None:
+        while len(cycles) <= cycle:
+            cycles.append({})
+            usage.append(defaultdict(int))
+
+    def find_cycle(engine: str, earliest: int) -> int:
+        cycle = earliest
+        limit = SLOT_LIMITS[engine]
+        while True:
+            ensure_cycle(cycle)
+            if usage[cycle][engine] < limit:
+                return cycle
+            cycle += 1
+
+    for engine, slot in slots:
+        reads, writes = _slot_rw(engine, slot)
+        earliest = 0
+        for addr in reads:
+            earliest = max(earliest, ready_time[addr])
+        for addr in writes:
+            earliest = max(earliest, last_write[addr] + 1, last_read[addr])
+
+        cycle = find_cycle(engine, earliest)
+        ensure_cycle(cycle)
+        cycles[cycle].setdefault(engine, []).append(slot)
+        usage[cycle][engine] += 1
+
+        for addr in reads:
+            if last_read[addr] < cycle:
+                last_read[addr] = cycle
+        for addr in writes:
+            last_write[addr] = cycle
+            ready_time[addr] = cycle + 1
+
+    return [c for c in cycles if c]
+
+
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
@@ -161,8 +273,10 @@ class KernelBuilder:
         two_const = self.scratch_const(2)
 
         # Preload all hash constants as vectors to avoid repeated broadcasts
+        # Also precompute multiply_add constants for hash optimization
         hash_consts_vec = []
-        for _, val1, _, _, val3 in HASH_STAGES:
+        hash_mul_vecs = []
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
             c1_vec = self.alloc_scratch(f"hash_c1_vec_{len(hash_consts_vec)}", VLEN)
             c3_vec = self.alloc_scratch(f"hash_c3_vec_{len(hash_consts_vec)}", VLEN)
             c1_scalar = self.scratch_const(val1)
@@ -170,6 +284,16 @@ class KernelBuilder:
             self.add("valu", ("vbroadcast", c1_vec, c1_scalar))
             self.add("valu", ("vbroadcast", c3_vec, c3_scalar))
             hash_consts_vec.append((c1_vec, c3_vec))
+
+            # Optimize: if pattern is val = (val + c1) + (val << c3), use multiply_add
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                mul_const = 1 + (1 << val3)
+                mul_vec = self.alloc_scratch(f"hash_mul_vec_{len(hash_mul_vecs)}", VLEN)
+                mul_scalar = self.scratch_const(mul_const)
+                self.add("valu", ("vbroadcast", mul_vec, mul_scalar))
+                hash_mul_vecs.append(mul_vec)
+            else:
+                hash_mul_vecs.append(None)
 
         # Prebroadcast commonly used values
         v_zero = self.alloc_scratch("v_zero", VLEN)
@@ -185,7 +309,6 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_forest_base, self.scratch["forest_values_p"]))
 
         self.add("flow", ("pause",))
-        self.add("debug", ("comment", "Starting optimized vectorized loop"))
 
         # Allocate vector registers for software pipelining with aggressive reuse
         # OPTIMIZATION: Only 4 vectors needed per batch (not 6!)
@@ -209,191 +332,83 @@ class KernelBuilder:
         v_addr = v_tmp1  # Computed addresses stored in tmp1
         v_node_val = v_tmp2  # Node values loaded into tmp2
 
-        body = []
+        # Generate all operations into a flat slots list for static scheduling
+        slots = []
 
-        # Precompute base addresses outside the loop - pack ALU operations
+        # Precompute base addresses
         base_addrs = []
         for batch_base in range(0, batch_size, VLEN):
             base_idx_addr = self.alloc_scratch(f"base_idx_addr_b{batch_base}")
             base_val_addr = self.alloc_scratch(f"base_val_addr_b{batch_base}")
-            # Load const and compute both addresses in sequence
-            body.append(("load", ("const", tmp1, batch_base)))
-            body.append(("alu", ("+", base_idx_addr, self.scratch["inp_indices_p"], tmp1)))
-            body.append(("alu", ("+", base_val_addr, self.scratch["inp_values_p"], tmp1)))
+            slots.append(("load", ("const", tmp1, batch_base)))
+            slots.append(("alu", ("+", base_idx_addr, self.scratch["inp_indices_p"], tmp1)))
+            slots.append(("alu", ("+", base_val_addr, self.scratch["inp_values_p"], tmp1)))
             base_addrs.append((base_idx_addr, base_val_addr))
 
-        # Note: ALU operations are very fast and don't bottleneck, so keeping simple
-
-        # Main loop - ULTIMATE OPTIMIZATION: Round fusion + collision-aware load sharing
-        # Strategy 1: Process ALL rounds before storing (K=rounds fusion)
-        # Strategy 2: Track which forest indices are being loaded and share them
-        K = rounds  # Fusion factor - process all 16 rounds per load/store
-
+        # Main loop with round fusion
+        K = rounds  # Process all rounds before storing
         for round_group_start in range(0, rounds, K):
             rounds_in_group = min(K, rounds - round_group_start)
 
-            # Process batches in groups of N_PIPELINE to avoid register conflicts
+            # Process batches in groups
             for group_start in range(0, num_batches, N_PIPELINE):
                 group_size = min(N_PIPELINE, num_batches - group_start)
-
-                # Define tasks for this group - WITH ROUND FUSION
-                tasks = []
-                batch_tasks = []
 
                 for local_idx in range(group_size):
                     buf = local_idx
                     batch_idx = group_start + local_idx
                     base_idx_addr, base_val_addr = base_addrs[batch_idx]
 
-                    batch_chain = {}
+                    # Load initial values
+                    slots.append(("load", ("vload", v_idx[buf], base_idx_addr)))
+                    slots.append(("load", ("vload", v_val[buf], base_val_addr)))
 
-                    # LOAD ONCE at the start of the fusion group
-                    input_load_task = {'engine': 'load', 'slot': [("vload", v_idx[buf], base_idx_addr), ("vload", v_val[buf], base_val_addr)], 'deps': [], 'done': False, 'batch': buf}
-                    tasks.append(input_load_task)
-                    batch_chain['input_load'] = input_load_task
-
-                    # Now process MULTIPLE rounds in sequence
-                    previous_round_task = input_load_task
-
+                    # Process all rounds
                     for round_in_group in range(rounds_in_group):
-                        # Each round: addr compute → node loads → XOR → hash → next_idx
-
                         # Address computation
-                        addr_task = {'engine': 'valu', 'slot': ("+", v_addr[buf], v_forest_base, v_idx[buf]), 'deps': [previous_round_task], 'done': False, 'batch': buf}
-                        tasks.append(addr_task)
+                        slots.append(("valu", ("+", v_addr[buf], v_forest_base, v_idx[buf])))
 
-                        # Scattered loads (4 pairs)
-                        scattered_load_tasks = []
-                        for load_idx in range(4):
-                            offset = load_idx * 2
-                            scattered_load_task = {'engine': 'load', 'slot': [("load", v_node_val[buf] + offset, v_addr[buf] + offset), ("load", v_node_val[buf] + offset + 1, v_addr[buf] + offset + 1)], 'deps': [addr_task], 'done': False, 'batch': buf, 'priority': 10}
-                            tasks.append(scattered_load_task)
-                            scattered_load_tasks.append(scattered_load_task)
+                        # Scattered loads
+                        for lane in range(VLEN):
+                            slots.append(("load", ("load", v_node_val[buf] + lane, v_addr[buf] + lane)))
 
                         # XOR
-                        xor_task = {'engine': 'valu', 'slot': ("^", v_val[buf], v_val[buf], v_node_val[buf]), 'deps': scattered_load_tasks, 'done': False, 'batch': buf}
-                        tasks.append(xor_task)
+                        slots.append(("valu", ("^", v_val[buf], v_val[buf], v_node_val[buf])))
 
-                        # Hash stages
-                        previous_hash_task = xor_task
+                        # Hash
                         for stage_idx in range(6):
                             op1, val1, op2, op3, val3 = HASH_STAGES[stage_idx]
                             c1_vec, c3_vec = hash_consts_vec[stage_idx]
+                            mul_vec = hash_mul_vecs[stage_idx]
 
-                            parallel_group_id = f"hash_r{round_in_group}_s{stage_idx}_b{buf}"
-                            op1_task = {'engine': 'valu', 'slot': (op1, v_tmp1[buf], v_val[buf], c1_vec), 'deps': [previous_hash_task], 'done': False, 'batch': buf, 'parallel_group': parallel_group_id}
-                            op3_task = {'engine': 'valu', 'slot': (op3, v_tmp2[buf], v_val[buf], c3_vec), 'deps': [previous_hash_task], 'done': False, 'batch': buf, 'parallel_group': parallel_group_id}
-                            tasks.append(op1_task)
-                            tasks.append(op3_task)
+                            if mul_vec is not None:
+                                # Optimized: val = val * mul + c1  (combines 3 ops into 1)
+                                slots.append(("valu", ("multiply_add", v_val[buf], v_val[buf], mul_vec, c1_vec)))
+                            else:
+                                # Standard: 3 separate operations
+                                slots.append(("valu", (op1, v_tmp1[buf], v_val[buf], c1_vec)))
+                                slots.append(("valu", (op3, v_tmp2[buf], v_val[buf], c3_vec)))
+                                slots.append(("valu", (op2, v_val[buf], v_tmp1[buf], v_tmp2[buf])))
 
-                            op2_task = {'engine': 'valu', 'slot': (op2, v_val[buf], v_tmp1[buf], v_tmp2[buf]), 'deps': [op1_task, op3_task], 'done': False, 'batch': buf}
-                            tasks.append(op2_task)
-                            previous_hash_task = op2_task
+                        # Next index computation: idx_new = (idx_old * 2) + ((val & 1) + 1)
+                        # Extract bit and add 1 using scalar ALU ops (more efficient)
+                        for lane in range(VLEN):
+                            slots.append(("alu", ("&", v_tmp1[buf] + lane, v_val[buf] + lane, one_const)))
+                            slots.append(("alu", ("+", v_tmp1[buf] + lane, v_tmp1[buf] + lane, one_const)))
 
-                        # Next index computation - OPTIMIZED: fuse operations where possible
-                        previous_next_task = previous_hash_task
-                        # Original: 6 sequential ops
-                        # Optimized: Can we parallelize any of these?
-                        # tmp1 = val & 1   and   tmp2 = idx << 1   are independent!
-                        and_task = {'engine': 'valu', 'slot': ("&", v_tmp1[buf], v_val[buf], v_one), 'deps': [previous_hash_task], 'done': False, 'batch': buf, 'parallel_group': f"next_init_r{round_in_group}_b{buf}"}
-                        shl_task = {'engine': 'valu', 'slot': ("<<", v_tmp2[buf], v_idx[buf], v_one), 'deps': [previous_hash_task], 'done': False, 'batch': buf, 'parallel_group': f"next_init_r{round_in_group}_b{buf}"}
-                        tasks.append(and_task)
-                        tasks.append(shl_task)
+                        # Use multiply_add: idx = idx * 2 + child_offset
+                        slots.append(("valu", ("multiply_add", v_idx[buf], v_idx[buf], v_two, v_tmp1[buf])))
 
-                        # Now the rest in sequence
-                        add1_task = {'engine': 'valu', 'slot': ("+", v_tmp1[buf], v_one, v_tmp1[buf]), 'deps': [and_task], 'done': False, 'batch': buf}
-                        tasks.append(add1_task)
+                        # Wrap to bounds
+                        slots.append(("valu", ("<", v_tmp2[buf], v_idx[buf], v_n_nodes)))
+                        slots.append(("valu", ("*", v_idx[buf], v_idx[buf], v_tmp2[buf])))
 
-                        add2_task = {'engine': 'valu', 'slot': ("+", v_idx[buf], v_tmp2[buf], v_tmp1[buf]), 'deps': [shl_task, add1_task], 'done': False, 'batch': buf}
-                        tasks.append(add2_task)
+                    # Store results
+                    slots.append(("store", ("vstore", base_idx_addr, v_idx[buf])))
+                    slots.append(("store", ("vstore", base_val_addr, v_val[buf])))
 
-                        cmp_task = {'engine': 'valu', 'slot': ("<", v_tmp1[buf], v_idx[buf], v_n_nodes), 'deps': [add2_task], 'done': False, 'batch': buf}
-                        tasks.append(cmp_task)
-
-                        mul_task = {'engine': 'valu', 'slot': ("*", v_idx[buf], v_idx[buf], v_tmp1[buf]), 'deps': [cmp_task], 'done': False, 'batch': buf}
-                        tasks.append(mul_task)
-
-                        previous_next_task = mul_task
-
-                        # This round's output becomes next round's input
-                        previous_round_task = previous_next_task
-
-                    # STORE ONCE at the end of the fusion group
-                    store_task = {'engine': 'store', 'slot': [("vstore", base_idx_addr, v_idx[buf]), ("vstore", base_val_addr, v_val[buf])], 'deps': [previous_round_task], 'done': False, 'batch': buf}
-                    tasks.append(store_task)
-                    batch_chain['store'] = store_task
-
-                    batch_tasks.append(batch_chain)
-
-                # MODULO SCHEDULING: Achieve steady-state pipeline throughput
-                # Key insight: Overlap stages from different batches/rounds for maximum ILP
-                cycle = 0
-                max_cycles = len(tasks) * 3  # Safety limit to prevent infinite loops
-
-                while any(not t['done'] for t in tasks) and cycle < max_cycles:
-                    ready = [t for t in tasks if not t['done'] and all(d['done'] for d in t['deps'])]
-                    if not ready:
-                        break
-
-                    # Group by engine type
-                    ready_by_engine = defaultdict(list)
-                    for t in ready:
-                        ready_by_engine[t['engine']].append(t)
-
-                    bundle = {}
-
-                    # AGGRESSIVE SLOT FILLING: Maximize utilization of all execution units
-                    for engine in ['load', 'valu', 'store']:
-                        if engine not in ready_by_engine:
-                            continue
-
-                        ready_engine = ready_by_engine[engine]
-                        limit = SLOT_LIMITS[engine]
-
-                        # Priority: loads > valu > stores
-                        # Sort by: priority, then batch (for locality)
-                        ready_engine.sort(key=lambda t: (-t.get('priority', 0), t.get('batch', 0)))
-
-                        selected = []
-                        current_slots = 0
-
-                        # GREEDY: Fill all available slots
-                        for t in ready_engine:
-                            slot_count = len(t['slot']) if isinstance(t['slot'], list) else 1
-                            if current_slots + slot_count <= limit:
-                                selected.append(t)
-                                current_slots += slot_count
-                                if current_slots == limit:
-                                    break
-
-                        if selected:
-                            bundle[engine] = []
-                            for t in selected:
-                                if isinstance(t['slot'], list):
-                                    bundle[engine].extend(t['slot'])
-                                else:
-                                    bundle[engine].append(t['slot'])
-                                t['done'] = True
-
-                    if bundle:
-                        body.append(("mega_bundle", bundle))
-
-                    cycle += 1
-
-                # Add debug compares if enabled
-                if ENABLE_DEBUG and group_start == 0:
-                    for vi in range(VLEN):
-                        body.append(("debug", ("compare", v_idx[0] + vi, (round, vi, "idx"))))
-                        body.append(("debug", ("compare", v_val[0] + vi, (round, vi, "val"))))
-                        body.append(("debug", ("compare", v_node_val[0] + vi, (round, vi, "node_val"))))
-                        for hi in range(len(HASH_STAGES)):
-                            body.append(("debug", ("compare", v_val[0] + vi, (round, vi, "hash_stage", hi))))
-                        body.append(("debug", ("compare", v_val[0] + vi, (round, vi, "hashed_val"))))
-                        body.append(("debug", ("compare", v_idx[0] + vi, (round, vi, "next_idx"))))
-                        body.append(("debug", ("compare", v_idx[0] + vi, (round, vi, "wrapped_idx"))))
-
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
+        # Use static scheduler to pack operations into VLIW bundles
+        self.instrs.extend(_schedule_slots(slots))
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
